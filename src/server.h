@@ -652,6 +652,7 @@ typedef enum {
 #define OBJ_SET 2       /* Set object. */
 #define OBJ_ZSET 3      /* Sorted set object. */
 #define OBJ_HASH 4      /* Hash object. */
+#define OBJ_HPYELOGLOG 7 /* Hyperloglog object. */
 
 /* The "module" object type is a special one that signals that the object
  * is one directly managed by a Redis module. In this case the value points
@@ -833,6 +834,8 @@ struct RedisModuleDigest {
 #define OBJ_ENCODING_QUICKLIST 9 /* Encoded as linked list of listpacks */
 #define OBJ_ENCODING_STREAM 10 /* Encoded as a radix tree of listpacks */
 #define OBJ_ENCODING_LISTPACK 11 /* Encoded as a listpack */
+#define OBJ_ENCODING_HLL_DENSE 12 /* Encoded as a dense hyperloglog */
+#define OBJ_ENCODING_HLL_SPARSE 13 /* Encoded as a sparse hyperloglog */
 
 #define LRU_BITS 24
 #define LRU_CLOCK_MAX ((1<<LRU_BITS)-1) /* Max value of obj->lru */
@@ -2994,6 +2997,10 @@ robj *hashTypeLookupWriteOrCreate(client *c, robj *key);
 robj *hashTypeGetValueObject(robj *o, sds field);
 int hashTypeSet(robj *o, sds field, sds value, int flags);
 robj *hashTypeDup(robj *o);
+
+void *hllGetData(robj *o);
+size_t hllGetDataLen(robj *o);
+void createRdbHllhdr(robj *o, struct rdb_hllhdr *hdr);
 
 /* Pub / Sub */
 int pubsubUnsubscribeAllChannels(client *c, int notify);

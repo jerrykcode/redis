@@ -678,6 +678,8 @@ int rdbSaveObjectType(rio *rdb, robj *o) {
             return rdbSaveType(rdb,RDB_TYPE_HASH);
         else
             serverPanic("Unknown hash encoding");
+    case OBJ_HYPERLOGLOG:
+        return rdbSaveType(rdb, RDB_TYPE_STRING); /* hyperloglog is saved as string object. */
     case OBJ_STREAM:
         return rdbSaveType(rdb,RDB_TYPE_STREAM_LISTPACKS_2);
     case OBJ_MODULE:
@@ -934,6 +936,30 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid) {
         } else {
             serverPanic("Unknown hash encoding");
         }
+    } else if (o->type == OBJ_HYPERLOGLOG) {
+        /* Save hyperloglog as a string value. */
+        struct rdb_hllhdr hdr;
+        int hdrlen, datalen;
+        void *p;
+
+        /* Save len. len = hdrlen + datalen + 1 (plus 1 for '\0' term) */
+        hdrlen = sizeof(hdr), datalen = hllGetDataLen(o);
+        if ((n = rdbSaveLen(rdb, hdrlen + datalen + 1)) == -1) return -1;
+        nwritten += n;
+
+        /* Save string value. We write the hdr and data separately. */
+        createRdbHllhdr(o, &hdr);
+        if (rdbWriteRaw(rdb, &hdr, hdrlen) == -1) return -1;
+        nwritten += hdrlen;
+        
+        p = hllGetData(o);
+        if (p == NULL) return -1;
+        /* This is the '\0' term, the data array in hyperloglog is allocated 1 more byte to simplify 
+         * the bit manipulation and now we can use this byte for '\0' term. */
+        p[datalen] = 0;
+        if (rdbWriteRaw(rdb, p, datalen + 1) == -1) return -1;
+        nwritten += datalen + 1;
+
     } else if (o->type == OBJ_STREAM) {
         /* Store how many listpacks we have inside the radix tree. */
         stream *s = o->ptr;

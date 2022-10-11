@@ -179,7 +179,28 @@
  * configured via the define server.hll_sparse_max_bytes.
  */
 
-struct hllhdr {
+/* structure of hyperloglog with dense representation. */
+struct denseHyperloglog {
+    uint8_t card[8];    /* Cached cardinality, little endian. */
+    uint8_t *registers; /* Data bytes array, length is HLL_DENSE_SIZE. */
+};
+
+/* structure of hyperloglog with sparse representation. */
+struct sparseHyperloglog {
+    uint8_t card[8];    /* Cached cardinality, little endian. */
+    uint16_t len;       /* Length of opcode array. */
+    uint16_t alloc;     /* Allocateed length of opcode array. */
+    uint8_t *opcode;    /* opcode array. */
+};
+
+/* We save the hyperloglog object in the rdb file as the format of a string object to
+ * compatible with the older version of hyperloglog.
+ * The string saved in the rdb file is constituted by this structure and data bytes(register
+ * or opcode) following it.
+ * Actually this structure is the header of the old version of hyperloglog, and now it can be
+ * used in the beginning of a string to indicate that it is a valid hyperloglog object.
+ */
+struct rdb_hllhdr {
     char magic[4];      /* "HYLL" */
     uint8_t encoding;   /* HLL_DENSE or HLL_SPARSE. */
     uint8_t notused[3]; /* Reserved for future use, must be zero. */
@@ -198,12 +219,69 @@ struct hllhdr {
 #define HLL_P_MASK (HLL_REGISTERS-1) /* Mask to index register. */
 #define HLL_BITS 6 /* Enough to count up to 63 leading zeroes. */
 #define HLL_REGISTER_MAX ((1<<HLL_BITS)-1)
-#define HLL_HDR_SIZE sizeof(struct hllhdr)
-#define HLL_DENSE_SIZE (HLL_HDR_SIZE+((HLL_REGISTERS*HLL_BITS+7)/8))
-#define HLL_DENSE 0 /* Dense encoding. */
-#define HLL_SPARSE 1 /* Sparse encoding. */
+#define HLL_DENSE_SIZE (((HLL_REGISTERS*HLL_BITS+7)/8))
+#define HLL_DENSE 0 /* Dense encoding for rdb_hllhdr. */
+#define HLL_SPARSE 1 /* Sparse encoding for rdb_hllhdr. */
 #define HLL_RAW 255 /* Only used internally, never exposed. */
 #define HLL_MAX_ENCODING 1
+
+void *hllGetData(robj *o) {
+    serverAssert(o->type == OBJ_HYPERLOGLOG);
+    int encoding = o->encoding;
+    serverAssert(encoding == OBJ_ENCODING_HLL_DENSE || encoding == OBJ_ENCODING_HLL_SPARSE);
+
+    if (encoding == OBJ_ENCODING_HLL_DENSE) {
+        return ((struct denseHyperloglog *)o->ptr)->registers;
+    } else {
+        return ((struct sparseHyperloglog *)o->ptr)->opcode;
+    }
+}
+
+size_t hllGetDataLen(robj *o) {
+    serverAssert(o->type == OBJ_HYPERLOGLOG);
+    int encoding = o->encoding;
+    serverAssert(encoding == OBJ_ENCODING_HLL_DENSE || encoding == OBJ_ENCODING_HLL_SPARSE);
+
+    if (encoding == OBJ_ENCODING_HLL_DENSE) {
+        return HLL_DENSE_SIZE;
+    } else {
+        return ((struct sparseHyperloglog *)o->ptr)->len;
+    }
+}
+
+void createRdbHllhdr(robj *o, struct rdb_hllhdr *hdr) {
+    serverAssert(o->type == OBJ_HYPERLOGLOG);
+    hdr->magic[0] = 'H';
+    hdr->magic[1] = 'Y';
+    hdr->magic[2] = 'L';
+    hdr->magic[3] = 'L';
+    memset(hdr->notused, 0, 3);
+    if (o->encoding == OBJ_ENCODING_HLL_DENSE) {
+        hdr->encoding = HLL_DENSE;
+        memcpy(hdr->card, ((struct denseHyperloglog *)o->ptr)->card, 8);
+    } else if (o->encoding == OBJ_ENCODING_HLL_SPARSE) {
+        hdr->encoding = HLL_SPARSE;
+        memcpy(hdr->card, ((struct sparseHyperloglog *)o->ptr)->card, 8);
+    } else {
+        serverPanic("Unknown hyperloglog encoding");
+    }
+}
+
+int isValidRdbHllhdr(struct rdb_hllhdr *hdr) {
+    /* Magic should be "HYLL". */
+    if (hdr->magic[0] != 'H' || hdr->magic[1] != 'Y' ||
+        hdr->magic[2] != 'L' || hdr->magic[3] != 'L') return 0;
+
+    if (hdr->encoding > HLL_MAX_ENCODING) return 0;
+
+    /* Dense representation string length should match exactly. */
+    if (hdr->encoding == HLL_DENSE &&
+        stringObjectLen(o) != HLL_DENSE_SIZE) return 0;
+
+    /* All tests passed. */
+    return 1;
+
+}
 
 static char *invalid_hll_err = "-INVALIDOBJ Corrupted HLL object detected";
 
