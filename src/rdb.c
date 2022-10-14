@@ -506,6 +506,9 @@ ssize_t rdbSaveStringObject(rio *rdb, robj *obj) {
  * RDB_LOAD_SDS: Return an SDS string instead of a Redis object.
  *
  * On I/O error NULL is returned.
+ *
+ * This function may return a hyperloglog object according to the string value
+ * as all hyperloglog objects are saved as string representation in rdb file.
  */
 void *rdbGenericLoadStringObject(rio *rdb, int flags, size_t *lenptr) {
     int plain = flags & RDB_LOAD_PLAIN;
@@ -546,14 +549,55 @@ void *rdbGenericLoadStringObject(rio *rdb, int flags, size_t *lenptr) {
         }
         return buf;
     } else {
-        robj *o = tryCreateStringObject(SDS_NOINIT,len);
-        if (!o) {
-            serverLog(isRestoreContext()? LL_VERBOSE: LL_WARNING, "rdbGenericLoadStringObject failed allocating %llu bytes", len);
+        robj *o;
+        if (len == 0) {
             return NULL;
-        }
-        if (len && rioRead(rdb,o->ptr,len) == 0) {
-            decrRefCount(o);
-            return NULL;
+        } else if (len <= sizeof(struct rdb_hllhdr)) {
+            o = tryCreateStringObject(SDS_NOINIT, len);
+            if (!o) {
+                serverLog(isRestoreContext()? LL_VERBOSE: LL_WARNING, "rdbGenericLoadStringObject failed allocating %llu bytes", len);
+                return NULL;
+            }
+            if (rioRead(rdb, o->ptr, len) == 0) {
+                decrRefCount(o);
+                return NULL;
+            }
+        } else {
+            /* Check if the string saved in rdb is a hyperloglog object. */
+            struct rdb_hllhdr hdr;
+            unsigned long long hdrlen, remainlen;
+            hdrlen = sizeof(hdr);
+            remainlen = len - hdrlen;
+
+            /* First read 'hdrlen' bytes to check if it is a hyperloglog. */
+            if (rioRead(rdb, &hdr, hdrlen) == 0)
+                return NULL;
+
+            if (isValidRdbHllhdr(&hdr, remainlen - 1)) {
+                size_t usable;
+                void *buf = ztrymalloc_usable(remainlen, &usable);
+                if (!buf) {
+                    serverLog(isRestoreContext()? LL_VERBOSE: LL_WARNING, "rdbGenericLoadStringObject failed allocating %llu bytes", remainlen);
+                    return NULL;
+                }
+                if (rioRead(rdb, buf, remainlen) == 0) {
+                    zfree(buf);
+                    return NULL;
+                }
+                o = createHLLObjectFromRdb(&hdr, buf, remainlen, usable);
+            } else {
+                /* The string is not a hyperloglog object. */
+                o = tryCreateStringObject(SDS_NOINIT, len);
+                if (!o) {
+                    serverLog(isRestoreContext()? LL_VERBOSE: LL_WARNING, "rdbGenericLoadStringObject failed allocating %llu bytes", len);
+                    return NULL;
+                }
+                memcpy(o->ptr, &hdr, hdrlen); /* Copy the bytes we read before. */
+                if (rioRead(rdb, o->ptr + hdrlen, remainlen) == 0) { /* Read the remaining bytes. */
+                    decrRefCount(o);
+                    return NULL;
+                }
+            }
         }
         return o;
     }

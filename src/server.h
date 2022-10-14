@@ -2621,6 +2621,7 @@ void freeListObject(robj *o);
 void freeSetObject(robj *o);
 void freeZsetObject(robj *o);
 void freeHashObject(robj *o);
+void freeHLLObject(robj *o);
 void dismissObject(robj *o, size_t dump_size);
 robj *createObject(int type, void *ptr);
 robj *createStringObject(const char *ptr, size_t len);
@@ -2998,9 +2999,26 @@ robj *hashTypeGetValueObject(robj *o, sds field);
 int hashTypeSet(robj *o, sds field, sds value, int flags);
 robj *hashTypeDup(robj *o);
 
+/* We save the hyperloglog object in the rdb file as the format of a string object to
+ * compatible with the older version of hyperloglog.
+ * The string saved in the rdb file is constituted by this structure and data bytes(register
+ * or opcode) following it.
+ * Actually this structure is the header of the old version of hyperloglog, and now it can be
+ * used in the beginning of a string to indicate that it is a valid hyperloglog object.
+ */
+struct rdb_hllhdr {
+    char magic[4];      /* "HYLL" */
+    uint8_t encoding;   /* HLL_DENSE or HLL_SPARSE. */
+    uint8_t notused[3]; /* Reserved for future use, must be zero. */
+    uint8_t card[8];    /* Cached cardinality, little endian. */
+    uint8_t registers[]; /* Data bytes. */
+};
+
 void *hllGetData(robj *o);
 size_t hllGetDataLen(robj *o);
 void createRdbHllhdr(robj *o, struct rdb_hllhdr *hdr);
+int isValidRdbHllhdr(struct rdb_hllhdr *hdr, unsigned long long datalen);
+robj *createHLLObjectFromRdb(struct rdb_hllhdr *hdr, void *buf, size_t buflen, size_t alloclen);
 
 /* Pub / Sub */
 int pubsubUnsubscribeAllChannels(client *c, int notify);

@@ -375,6 +375,7 @@ void decrRefCount(robj *o) {
         case OBJ_SET: freeSetObject(o); break;
         case OBJ_ZSET: freeZsetObject(o); break;
         case OBJ_HASH: freeHashObject(o); break;
+        case OBJ_HYPERLOGLOG: freeHLLObject(o); break;
         case OBJ_MODULE: freeModuleObject(o); break;
         case OBJ_STREAM: freeStreamObject(o); break;
         default: serverPanic("Unknown object type"); break;

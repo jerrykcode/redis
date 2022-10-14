@@ -188,26 +188,12 @@ struct denseHyperloglog {
 /* structure of hyperloglog with sparse representation. */
 struct sparseHyperloglog {
     uint8_t card[8];    /* Cached cardinality, little endian. */
-    uint16_t len;       /* Length of opcode array. */
-    uint16_t alloc;     /* Allocateed length of opcode array. */
+    size_t len;       /* Length of opcode array. */
+    size_t alloc;     /* Allocateed length of opcode array. */
     uint8_t *opcode;    /* opcode array. */
 };
 
-/* We save the hyperloglog object in the rdb file as the format of a string object to
- * compatible with the older version of hyperloglog.
- * The string saved in the rdb file is constituted by this structure and data bytes(register
- * or opcode) following it.
- * Actually this structure is the header of the old version of hyperloglog, and now it can be
- * used in the beginning of a string to indicate that it is a valid hyperloglog object.
- */
-struct rdb_hllhdr {
-    char magic[4];      /* "HYLL" */
-    uint8_t encoding;   /* HLL_DENSE or HLL_SPARSE. */
-    uint8_t notused[3]; /* Reserved for future use, must be zero. */
-    uint8_t card[8];    /* Cached cardinality, little endian. */
-    uint8_t registers[]; /* Data bytes. */
-};
-
+#define HLL_CARD_SIZE 8
 /* The cached cardinality MSB is used to signal validity of the cached value. */
 #define HLL_INVALIDATE_CACHE(hdr) (hdr)->card[7] |= (1<<7)
 #define HLL_VALID_CACHE(hdr) (((hdr)->card[7] & (1<<7)) == 0)
@@ -249,6 +235,7 @@ size_t hllGetDataLen(robj *o) {
     }
 }
 
+/* Create a rdb_hllhdr structure (which will be saved in the rdb) by a hyperloglog object. */
 void createRdbHllhdr(robj *o, struct rdb_hllhdr *hdr) {
     serverAssert(o->type == OBJ_HYPERLOGLOG);
     hdr->magic[0] = 'H';
@@ -267,7 +254,7 @@ void createRdbHllhdr(robj *o, struct rdb_hllhdr *hdr) {
     }
 }
 
-int isValidRdbHllhdr(struct rdb_hllhdr *hdr) {
+int isValidRdbHllhdr(struct rdb_hllhdr *hdr, unsigned long long datalen) {
     /* Magic should be "HYLL". */
     if (hdr->magic[0] != 'H' || hdr->magic[1] != 'Y' ||
         hdr->magic[2] != 'L' || hdr->magic[3] != 'L') return 0;
@@ -276,11 +263,38 @@ int isValidRdbHllhdr(struct rdb_hllhdr *hdr) {
 
     /* Dense representation string length should match exactly. */
     if (hdr->encoding == HLL_DENSE &&
-        stringObjectLen(o) != HLL_DENSE_SIZE) return 0;
+        datalen != HLL_DENSE_SIZE) return 0;
 
-    /* All tests passed. */
     return 1;
+}
 
+/* Create a hyperloglog object from rdb file.
+ * Hyperloglog is saved in rdb file as a string constituted by rdb_hllhdr structuer and data bytes(register
+ * or opcode) following it. The parameter 'hdr' and 'buf' points to the rdb_hllhdr and data bytes.
+ */
+robj *createHLLObjectFromRdb(struct rdb_hllhdr *hdr, void *buf, size_t buflen, size_t alloclen) {
+    robj *o;
+    void *ptr;
+    int encoding;
+    serverAssert(hdr->encoding < HLL_MAX_ENCODING);
+    if (hdr->encoding == HLL_DENSE) {
+        encoding = OBJ_ENCODING_HLL_DENSE;
+        struct denseHyperloglog *hll = zmalloc(sizeof(*hll));
+        memcpy(hll->card, hdr->card, HLL_CARD_SIZE);
+        hll->registers = buf;
+        ptr = hll;
+    } else {
+        encoding = OBJ_ENCODING_HLL_SPARSE;
+        struct sparseHyperloglog *hll = zmalloc(sizeof(*hll));
+        memcpy(hll->card, hdr->card, HLL_CARD_SIZE);
+        hll->len = buflen - 1; /* The last byte is the string '\0' term, hll->len do not count it. */
+        hll->alloc = alloclen;
+        hll->opcode = buf;
+        ptr = hll;
+    }
+    o = createObject(OBJ_HYPERLOGLOG, hll);
+    hll->encoding = encoding;
+    return o;
 }
 
 static char *invalid_hll_err = "-INVALIDOBJ Corrupted HLL object detected";
@@ -661,26 +675,24 @@ void hllDenseRegHisto(uint8_t *registers, int* reghisto) {
  * The function returns C_OK if the sparse representation was valid,
  * otherwise C_ERR is returned if the representation was corrupted. */
 int hllSparseToDense(robj *o) {
-    sds sparse = o->ptr, dense;
-    struct hllhdr *hdr, *oldhdr = (struct hllhdr*)sparse;
-    int idx = 0, runlen, regval;
-    uint8_t *p = (uint8_t*)sparse, *end = p+sdslen(sparse);
+    serverAssert(o->type = OBJ_HYPERLOGLOG);
 
     /* If the representation is already the right one return ASAP. */
-    hdr = (struct hllhdr*) sparse;
-    if (hdr->encoding == HLL_DENSE) return C_OK;
+    if (o->encoding == OBJ_ENCODING_HLL_DENSE) return C_OK;
 
-    /* Create a string of the right size filled with zero bytes.
-     * Note that the cached cardinality is set to 0 as a side effect
-     * that is exactly the cardinality of an empty HLL. */
-    dense = sdsnewlen(NULL,HLL_DENSE_SIZE);
-    hdr = (struct hllhdr*) dense;
-    *hdr = *oldhdr; /* This will copy the magic and cached cardinality. */
-    hdr->encoding = HLL_DENSE;
+    struct sparseHyperloglog *sparseHll = (struct sparseHyperloglog *)o->ptr;
+    uint8_t *p = (uint8_t*)sparseHll->opcode, *end = p + sparseHll->len;
 
+
+    /* Create dense hyperloglog. */
+    struct denseHyperloglog *denseHll = zmalloc(sizeof(*denseHll));
+    memcpy(denseHll->card, sparseHll->card, HLL_CARD_SIZE);
+    denseHll->registers = zmalloc(HLL_DENSE_SIZE + 1);
+    memset(denseHll->registers, 0, HLL_DENSE_SIZE + 1);
+
+    int idx = 0, runlen, regval;
     /* Now read the sparse representation and set non-zero registers
      * accordingly. */
-    p += HLL_HDR_SIZE;
     while(p < end) {
         if (HLL_SPARSE_IS_ZERO(p)) {
             runlen = HLL_SPARSE_ZERO_LEN(p);
@@ -695,7 +707,7 @@ int hllSparseToDense(robj *o) {
             regval = HLL_SPARSE_VAL_VALUE(p);
             if ((runlen + idx) > HLL_REGISTERS) break; /* Overflow. */
             while(runlen--) {
-                HLL_DENSE_SET_REGISTER(hdr->registers,idx,regval);
+                HLL_DENSE_SET_REGISTER(denseHll->registers,idx,regval);
                 idx++;
             }
             p++;
@@ -705,13 +717,15 @@ int hllSparseToDense(robj *o) {
     /* If the sparse representation was valid, we expect to find idx
      * set to HLL_REGISTERS. */
     if (idx != HLL_REGISTERS) {
-        sdsfree(dense);
+        zfree(denseHll->registers);
+        zfree(denseHll);
         return C_ERR;
     }
 
     /* Free the old representation and set the new one. */
-    sdsfree(o->ptr);
-    o->ptr = dense;
+    zfree(sparseHll->opcode);
+    zfree(sparseHll);
+    o->ptr = denseHll;
     return C_OK;
 }
 
@@ -1188,23 +1202,28 @@ int hllMerge(uint8_t *max, robj *hll) {
 
 /* ========================== HyperLogLog commands ========================== */
 
-/* Create an HLL object. We always create the HLL using sparse encoding.
+/* Create an Hyperloglog object. We always create the HLL using sparse encoding.
  * This will be upgraded to the dense representation as needed. */
 robj *createHLLObject(void) {
     robj *o;
-    struct hllhdr *hdr;
-    sds s;
+    struct sparseHyperloglog *hll;
+    size_t sparselen = ((HLL_REGISTERS+(HLL_SPARSE_XZERO_MAX_LEN-1)) / HLL_SPARSE_XZERO_MAX_LEN)*2;
+    size_t usable;
+
+    hll = zmalloc(sizeof(*hll));
+    HLL_INVALIDATE_CACHE(hll);
+    hll->len = sparselen;
+    hll->opcode = zmalloc_usable(sparselen + 1, &usable); /* sparselen + 1: one more byte at the end to simplify the operation. */
+    memset(hll->opcode, 0, sparselen + 1);
+    hll->alloc = usable - 1;
+
     uint8_t *p;
-    int sparselen = HLL_HDR_SIZE +
-                    (((HLL_REGISTERS+(HLL_SPARSE_XZERO_MAX_LEN-1)) /
-                     HLL_SPARSE_XZERO_MAX_LEN)*2);
     int aux;
 
     /* Populate the sparse representation with as many XZERO opcodes as
      * needed to represent all the registers. */
     aux = HLL_REGISTERS;
-    s = sdsnewlen(NULL,sparselen);
-    p = (uint8_t*)s + HLL_HDR_SIZE;
+    p = hll->opcode;
     while(aux) {
         int xzero = HLL_SPARSE_XZERO_MAX_LEN;
         if (xzero > aux) xzero = aux;
@@ -1212,14 +1231,30 @@ robj *createHLLObject(void) {
         p += 2;
         aux -= xzero;
     }
-    serverAssert((p-(uint8_t*)s) == sparselen);
+    serverAssert((p-(uint8_t*)hll->opcode) == sparselen);
 
     /* Create the actual object. */
-    o = createObject(OBJ_STRING,s);
-    hdr = o->ptr;
-    memcpy(hdr->magic,"HYLL",4);
-    hdr->encoding = HLL_SPARSE;
+    o = createObject(OBJ_HYPERLOGLOG, hll);
+    o->encoding = OBJ_ENCODING_HLL_SPARSE;
     return o;
+}
+
+void freeHLLObject(robj *o) {
+    switch (o->encoding) {
+    case OBJ_ENCODING_HLL_DENSE:
+        struct denseHyperloglog *hll = o->ptr;
+        zfree(hll->registers);
+        zfree(o->ptr);
+        break;
+    case OBJ_ENCODING_HLL_SPARSE:
+        struct sparseHyperloglog *hll = o->ptr;
+        zfree(hll->opcode);
+        zfree(o->ptr);
+        break;
+    default:
+        serverPanic("Unknown hyperloglog encoding type");
+        break;
+    }
 }
 
 /* Check if the object is a String with a valid HLL representation.
