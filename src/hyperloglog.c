@@ -188,8 +188,8 @@ struct denseHyperloglog {
 /* structure of hyperloglog with sparse representation. */
 struct sparseHyperloglog {
     uint8_t card[8];    /* Cached cardinality, little endian. */
-    size_t len;       /* Length of opcode array. */
-    size_t alloc;     /* Allocateed length of opcode array. */
+    uint16_t len;       /* Length of opcode array. */
+    uint16_t alloc;     /* Allocateed length of opcode array. */
     uint8_t *opcode;    /* opcode array. */
 };
 
@@ -272,7 +272,7 @@ int isValidRdbHllhdr(struct rdb_hllhdr *hdr, unsigned long long datalen) {
  * Hyperloglog is saved in rdb file as a string constituted by rdb_hllhdr structuer and data bytes(register
  * or opcode) following it. The parameter 'hdr' and 'buf' points to the rdb_hllhdr and data bytes.
  */
-robj *createHLLObjectFromRdb(struct rdb_hllhdr *hdr, void *buf, size_t buflen, size_t alloclen) {
+robj *createHLLObjectFromRdb(struct rdb_hllhdr *hdr, void *data, size_t datalen, size_t alloclen) {
     robj *o;
     void *ptr;
     int encoding;
@@ -281,15 +281,15 @@ robj *createHLLObjectFromRdb(struct rdb_hllhdr *hdr, void *buf, size_t buflen, s
         encoding = OBJ_ENCODING_HLL_DENSE;
         struct denseHyperloglog *hll = zmalloc(sizeof(*hll));
         memcpy(hll->card, hdr->card, HLL_CARD_SIZE);
-        hll->registers = buf;
+        hll->registers = data;
         ptr = hll;
     } else {
         encoding = OBJ_ENCODING_HLL_SPARSE;
         struct sparseHyperloglog *hll = zmalloc(sizeof(*hll));
         memcpy(hll->card, hdr->card, HLL_CARD_SIZE);
-        hll->len = buflen - 1; /* The last byte is the string '\0' term, hll->len do not count it. */
+        hll->len = datalen;
         hll->alloc = alloclen;
-        hll->opcode = buf;
+        hll->opcode = data;
         ptr = hll;
     }
     o = createObject(OBJ_HYPERLOGLOG, hll);
@@ -745,8 +745,8 @@ int hllSparseToDense(robj *o) {
  * not representable with the sparse representation, or when the resulting
  * size would be greater than server.hll_sparse_max_bytes. */
 int hllSparseSet(robj *o, long index, uint8_t count) {
-    struct hllhdr *hdr;
-    uint8_t oldcount, *sparse, *end, *p, *prev, *next;
+    struct sparseHyperloglog *hll = o->ptr;
+    uint8_t oldcount, *end, *p, *prev, *next;
     long first, span;
     long is_zero = 0, is_xzero = 0, is_val = 0, runlen = 0;
 
@@ -759,12 +759,19 @@ int hllSparseSet(robj *o, long index, uint8_t count) {
      * into XZERO-VAL-XZERO). Make sure there is enough space right now
      * so that the pointers we take during the execution of the function
      * will be valid all the time. */
-    o->ptr = sdsMakeRoomFor(o->ptr,3);
+    uint16_t needlen = hll->len + 1 + 3; /* plus 1 for '\0' term, +3 for the new space we need. */
+    if (hll->alloc < needlen) {
+        size_t usable;
+        needlen <<= 1; /* enlarge more than needed, to avoid need for future reallocs on incremental growth. */
+        if (needlen > server.hll_sparse_max_bytes) needlen = server.hll_sparse_max_bytes;
+        hll->opcode = zrealloc_usable(needlen, &usable);
+        hll->alloc = usable;
+    }
 
     /* Step 1: we need to locate the opcode we need to modify to check
      * if a value update is actually needed. */
-    sparse = p = ((uint8_t*)o->ptr) + HLL_HDR_SIZE;
-    end = p + sdslen(o->ptr) - HLL_HDR_SIZE;
+    p = hll->opcode;
+    end = p + hll->len;
 
     first = 0;
     prev = NULL; /* Points to previous opcode at the end of the loop. */
@@ -934,7 +941,7 @@ updated:
      * The representation was updated, however the resulting representation
      * may not be optimal: adjacent VAL opcodes can sometimes be merged into
      * a single one. */
-    p = prev ? prev : sparse;
+    p = prev ? prev : hll->opcode;
     int scanlen = 5; /* Scan up to 5 upcodes starting from prev. */
     while (p < end && scanlen--) {
         if (HLL_SPARSE_IS_XZERO(p)) {
@@ -954,7 +961,8 @@ updated:
                 if (len <= HLL_SPARSE_VAL_MAX_LEN) {
                     HLL_SPARSE_VAL_SET(p+1,v1,len);
                     memmove(p,p+1,end-p);
-                    sdsIncrLen(o->ptr,-1);
+                    hll->len--;
+                    hll->opcode[len] = '\0';
                     end--;
                     /* After a merge we reiterate without incrementing 'p'
                      * in order to try to merge the just merged value with
@@ -967,13 +975,12 @@ updated:
     }
 
     /* Invalidate the cached cardinality. */
-    hdr = o->ptr;
-    HLL_INVALIDATE_CACHE(hdr);
+    HLL_INVALIDATE_CACHE(hll);
     return 1;
 
 promote: /* Promote to dense representation. */
     if (hllSparseToDense(o) == C_ERR) return -1; /* Corrupted HLL. */
-    hdr = o->ptr;
+    struct denseHyperloglog *denseHll = o->ptr;
 
     /* We need to call hllDenseAdd() to perform the operation after the
      * conversion. However the result must be 1, since if we need to
@@ -982,7 +989,7 @@ promote: /* Promote to dense representation. */
      * Note that this in turn means that PFADD will make sure the command
      * is propagated to slaves / AOF, so if there is a sparse -> dense
      * conversion, it will be performed in all the slaves as well. */
-    int dense_retval = hllDenseSet(hdr->registers,index,count);
+    int dense_retval = hllDenseSet(denseHll->registers,index,count);
     serverAssert(dense_retval == 1);
     return dense_retval;
 }
@@ -1103,7 +1110,7 @@ double hllTau(double x) {
  * is, hdr->registers will point to an uint8_t array of HLL_REGISTERS element.
  * This is useful in order to speedup PFCOUNT when called against multiple
  * keys (no need to work with 6-bit integers encoding). */
-uint64_t hllCount(struct hllhdr *hdr, int *invalid) {
+uint64_t hllCount(robj *o, int *invalid) {
     double m = HLL_REGISTERS;
     double E;
     int j;
@@ -1116,10 +1123,10 @@ uint64_t hllCount(struct hllhdr *hdr, int *invalid) {
 
     /* Compute register histogram */
     if (hdr->encoding == HLL_DENSE) {
-        hllDenseRegHisto(hdr->registers,reghisto);
+        hllDenseRegHisto(((struct denseHyperloglog *)o->ptr)->registers,reghisto);
     } else if (hdr->encoding == HLL_SPARSE) {
-        hllSparseRegHisto(hdr->registers,
-                         sdslen((sds)hdr)-HLL_HDR_SIZE,invalid,reghisto);
+        struct sparseHyperloglog *hll = o->ptr;
+        hllSparseRegHisto(hll->opcode, hll->len, invalid, reghisto);
     } else if (hdr->encoding == HLL_RAW) {
         hllRawRegHisto(hdr->registers,reghisto);
     } else {
@@ -1142,10 +1149,9 @@ uint64_t hllCount(struct hllhdr *hdr, int *invalid) {
 
 /* Call hllDenseAdd() or hllSparseAdd() according to the HLL encoding. */
 int hllAdd(robj *o, unsigned char *ele, size_t elesize) {
-    struct hllhdr *hdr = o->ptr;
-    switch(hdr->encoding) {
-    case HLL_DENSE: return hllDenseAdd(hdr->registers,ele,elesize);
-    case HLL_SPARSE: return hllSparseAdd(o,ele,elesize);
+    switch(o->encoding) {
+    case OBJ_ENCODING_HLL_DENSE: return hllDenseAdd(((struct denseHyperloglog *)o->ptr)->registers,ele,elesize);
+    case OBJ_ENCODING_HLL_SPARSE: return hllSparseAdd(o,ele,elesize);
     default: return -1; /* Invalid representation. */
     }
 }

@@ -573,17 +573,18 @@ void *rdbGenericLoadStringObject(rio *rdb, int flags, size_t *lenptr) {
             if (rioRead(rdb, &hdr, hdrlen) == 0)
                 return NULL;
 
-            if (isValidRdbHllhdr(&hdr, remainlen - 1)) {
+            if (isValidRdbHllhdr(&hdr, remainlen)) {
                 size_t usable;
-                void *buf = ztrymalloc_usable(remainlen, &usable);
+                void *buf = ztrymalloc_usable(remainlen + 1, &usable);
                 if (!buf) {
-                    serverLog(isRestoreContext()? LL_VERBOSE: LL_WARNING, "rdbGenericLoadStringObject failed allocating %llu bytes", remainlen);
+                    serverLog(isRestoreContext()? LL_VERBOSE: LL_WARNING, "rdbGenericLoadStringObject failed allocating %llu bytes", remainlen + 1);
                     return NULL;
                 }
                 if (rioRead(rdb, buf, remainlen) == 0) {
                     zfree(buf);
                     return NULL;
                 }
+                buf[remainlen] = 0;
                 o = createHLLObjectFromRdb(&hdr, buf, remainlen, usable);
             } else {
                 /* The string is not a hyperloglog object. */
@@ -986,9 +987,9 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid) {
         int hdrlen, datalen;
         void *p;
 
-        /* Save len. len = hdrlen + datalen + 1 (plus 1 for '\0' term) */
+        /* Save len. len = hdrlen + datalen */
         hdrlen = sizeof(hdr), datalen = hllGetDataLen(o);
-        if ((n = rdbSaveLen(rdb, hdrlen + datalen + 1)) == -1) return -1;
+        if ((n = rdbSaveLen(rdb, hdrlen + datalen)) == -1) return -1;
         nwritten += n;
 
         /* Save string value. We write the hdr and data separately. */
@@ -998,11 +999,8 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid) {
         
         p = hllGetData(o);
         if (p == NULL) return -1;
-        /* This is the '\0' term, the data array in hyperloglog is allocated 1 more byte to simplify 
-         * the bit manipulation and now we can use this byte for '\0' term. */
-        p[datalen] = 0;
-        if (rdbWriteRaw(rdb, p, datalen + 1) == -1) return -1;
-        nwritten += datalen + 1;
+        if (rdbWriteRaw(rdb, p, datalen) == -1) return -1;
+        nwritten += datalen;
 
     } else if (o->type == OBJ_STREAM) {
         /* Store how many listpacks we have inside the radix tree. */
