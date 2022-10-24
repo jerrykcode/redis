@@ -681,6 +681,9 @@ int rdbSaveObjectType(rio *rdb, robj *o) {
             return rdbSaveType(rdb,RDB_TYPE_HASH);
         else
             serverPanic("Unknown hash encoding");
+    case OBJ_HYPERLOGLOG:
+        //todo
+        break;
     case OBJ_STREAM:
         return rdbSaveType(rdb,RDB_TYPE_STREAM_LISTPACKS_2);
     case OBJ_MODULE:
@@ -937,6 +940,8 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid) {
         } else {
             serverPanic("Unknown hash encoding");
         }
+    } else if (o->type == OBJ_HYPERLOGLOG) {
+        //todo
     } else if (o->type == OBJ_STREAM) {
         /* Store how many listpacks we have inside the radix tree. */
         stream *s = o->ptr;

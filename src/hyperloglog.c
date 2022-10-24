@@ -65,15 +65,25 @@
  * HLL header
  * ===
  *
- * Both the dense and sparse representation have a 16 byte header as follows:
+ * The dense representation have a 9 byte header as follows:
  *
- * +------+---+-----+----------+
- * | HYLL | E | N/U | Cardin.  |
- * +------+---+-----+----------+
+ *               +---------+---+
+ *               | Cardin. | E |
+ *               +---------+---+
+ * 
+ * The sparse representation have a 13 byte header as follows:
  *
- * The first 4 bytes are a magic string set to the bytes "HYLL".
- * "E" is one byte encoding, currently set to HLL_DENSE or
- * HLL_SPARSE. N/U are three not used bytes.
+ * +-----+-------+---------+---+
+ * | Len | Alloc | Cardin. | E |
+ * +-----+-------+---------+---+
+ *
+ * "Len" for sparse representation is a 2 byte value indicates to the
+ *  length of the data following the header.
+ * "Alloc" for sparse representation is a 2 byte value indicates to the 
+ * allocated size for data.
+ * For dense representation, length of the data is a fixed value. 
+ * For both representation, "E" is one byte encoding, currently set to 
+ * HLL_DENSE or HLL_SPARSE. 
  *
  * The "Cardin." field is a 64 bit integer stored in little endian format
  * with the latest cardinality computed that can be reused if the data
@@ -179,12 +189,18 @@
  * configured via the define server.hll_sparse_max_bytes.
  */
 
+#define CARD_BYTES 8
+
 struct hllhdr {
-    char magic[4];      /* "HYLL" */
+    uint8_t card[CARD_BYTES];    /* Cached cardinality, little endian. */
     uint8_t encoding;   /* HLL_DENSE or HLL_SPARSE. */
-    uint8_t notused[3]; /* Reserved for future use, must be zero. */
-    uint8_t card[8];    /* Cached cardinality, little endian. */
     uint8_t registers[]; /* Data bytes. */
+};
+
+struct __attribute__ ((__packed__)) sparse_hllhdr {
+    uint16_t len;     /* length of data bytes. */
+    uint16_t alloc;   /* allocated length, excluding the header and the last one byte. */
+    struct hllhdr hdr;/* Cached cardinality and encoding. */
 };
 
 /* The cached cardinality MSB is used to signal validity of the cached value. */
@@ -199,7 +215,11 @@ struct hllhdr {
 #define HLL_BITS 6 /* Enough to count up to 63 leading zeroes. */
 #define HLL_REGISTER_MAX ((1<<HLL_BITS)-1)
 #define HLL_HDR_SIZE sizeof(struct hllhdr)
-#define HLL_DENSE_SIZE (HLL_HDR_SIZE+((HLL_REGISTERS*HLL_BITS+7)/8))
+#define HLL_SPARSE_HDR_SIZE sizeof(struct sparse_hllhdr)
+#define HLL_SPARSE_HDR_PREFIX (HLL_SPARSE_HDR_SIZE - HLL_HDR_SIZE)
+#define HLL_DENSE_REGISTERS_SIZE ((HLL_REGISTERS*HLL_BITS+7)/8)
+#define HLL_DENSE_SIZE (HLL_HDR_SIZE+HLL_DENSE_REGISTERS_SIZE+1) /* plus 1 because we allocate 
+                                        one more byte at the end to simplify the bit operations. */
 #define HLL_DENSE 0 /* Dense encoding. */
 #define HLL_SPARSE 1 /* Sparse encoding. */
 #define HLL_RAW 255 /* Only used internally, never exposed. */
@@ -329,10 +349,9 @@ static char *invalid_hll_err = "-INVALIDOBJ Corrupted HLL object detected";
  * with "val" left-shifted by "rs" bits to set the new value.
  */
 
-/* Note: if we access the last counter, we will also access the b+1 byte
- * that is out of the array, but sds strings always have an implicit null
- * term, so the byte exists, and we can skip the conditional (or the need
- * to allocate 1 byte more explicitly). */
+/* Note: if we access the last counter, we will also access the b+1 byte,
+ * but we have allocate one more byte explicitly, so the byte exists, and
+ * we can skip the conditional. */
 
 /* Store the value of the register at position 'regnum' into variable 'target'.
  * 'p' is an array of unsigned bytes. */
@@ -387,6 +406,93 @@ static char *invalid_hll_err = "-INVALIDOBJ Corrupted HLL object detected";
     *((p)+1) = (_l&0xff); \
 } while(0)
 #define HLL_ALPHA_INF 0.721347520444481703680 /* constant for 0.5/ln(2) */
+
+/* ==== Functions to create and release hyperloglog of different encodings. ===== */
+
+/* Create a hyperloglog with dense representation. Set its cached cardinality
+   to 'card' if 'card' is not NULL. */
+static struct hllhdr *createDenseHll(uint8_t *card) {
+    void *p = zmalloc(HLL_DENSE_SIZE);
+    struct hllhdr *hdr = (struct hllhdr *)p;
+    if (card)
+        memcpy(hdr->card, card, CARD_BYTES);
+    else
+        HLL_INVALIDATE_CACHE(hdr);
+    hdr->encoding = HLL_DENSE;
+    return hdr;
+}
+
+/* Create a hyperloglog with sparse representation. 'needlen' is the length of data
+ * we need and 'len' is the length we actually used. 
+ * We use realloc if 'ptr' is not NULL. */
+static struct hllhdr *createSparseHll(uint16_t needlen, uint16_t len, void *ptr) {
+    size_t usable, alloc;
+    /* Same as zmalloc_usable if 'ptr' is NULL. */
+    ptr = zrealloc_usable(ptr, HLL_SPARSE_HDR_SIZE + needlen + 1, &usable);
+    alloc = usable - HLL_SPARSE_HDR_SIZE - 1;
+    serverAssert(alloc <= 0xffff);
+
+    struct sparse_hllhdr *shdr = (struct sparse_hllhdr *)ptr;
+    shdr->len = len;
+    shdr->alloc = alloc;
+
+    struct hllhdr *hdr = &shdr->hdr;
+    HLL_INVALIDATE_CACHE(hdr);
+    hdr->encoding = HLL_SPARSE;
+
+    return hdr;
+}
+
+/* We can use this function to create a hyperloglog object from rdb file. */
+robj *createHllObject(uint16_t len, int encoding) {
+    robj *o;
+    struct hllhdr *hdr;
+    if (encoding == HLL_DENSE) {
+        serverAssert(len == HLL_DENSE_REGISTERS_SIZE);
+        hdr = createDenseHll(NULL);
+    } else if (encoding == HLL_SPARSE) {
+        hdr = createSparseHll(len, len, NULL);
+    } else {
+        serverPanic("Unknown hyperloglog encoding");
+    }
+    o = createObject(OBJ_HYPERLOGLOG, hdr);
+    return o;
+}
+
+static struct sparse_hllhdr *getSparseHdr(struct hllhdr *hdr) {
+    serverAssert(hdr->encoding == HLL_SPARSE);
+    uint8_t *p = (uint8_t *)hdr;
+    return (struct sparse_hllhdr *)(p - HLL_SPARSE_HDR_PREFIX);
+}
+
+static uint16_t getSparseLen(struct hllhdr *hdr) {
+    return getSparseHdr(hdr)->len;
+}
+
+static void sparseHllIncrLen(struct hllhdr *hdr, uint16_t incrlen) {
+    struct sparse_hllhdr *shdr = getSparseHdr(hdr);
+    shdr->len += incrlen;
+}
+
+static struct hllhdr *sparseHllExpandSize(struct hllhdr *hdr, uint16_t addlen) {
+    struct sparse_hllhdr *shdr = getSparseHdr(hdr);
+    uint16_t oldlen = shdr->len;
+    if (shdr->alloc - oldlen >= addlen) return hdr;
+
+    uint16_t newlen = (oldlen + addlen) << 1; /* enlarge more than needed, to avoid need
+                                                    for future reallocs on incremental growth. */
+    return createSparseHll(newlen, oldlen, shdr);
+}
+
+void releaseHll(struct hllhdr *hdr) {
+    if (hdr->encoding == HLL_DENSE) {
+        zfree((void *)hdr);
+    } else if (hdr->encoding == HLL_SPARSE) {
+        zfree((void *)getSparseHdr(hdr));
+    } else {
+        serverPanic("Unknown hyperloglog encoding");
+    }
+}
 
 /* ========================= HyperLogLog algorithm  ========================= */
 
@@ -583,26 +689,18 @@ void hllDenseRegHisto(uint8_t *registers, int* reghisto) {
  * The function returns C_OK if the sparse representation was valid,
  * otherwise C_ERR is returned if the representation was corrupted. */
 int hllSparseToDense(robj *o) {
-    sds sparse = o->ptr, dense;
-    struct hllhdr *hdr, *oldhdr = (struct hllhdr*)sparse;
-    int idx = 0, runlen, regval;
-    uint8_t *p = (uint8_t*)sparse, *end = p+sdslen(sparse);
-
+    struct hllhdr *hdr = o->ptr, *oldhdr;
     /* If the representation is already the right one return ASAP. */
-    hdr = (struct hllhdr*) sparse;
     if (hdr->encoding == HLL_DENSE) return C_OK;
 
-    /* Create a string of the right size filled with zero bytes.
-     * Note that the cached cardinality is set to 0 as a side effect
-     * that is exactly the cardinality of an empty HLL. */
-    dense = sdsnewlen(NULL,HLL_DENSE_SIZE);
-    hdr = (struct hllhdr*) dense;
-    *hdr = *oldhdr; /* This will copy the magic and cached cardinality. */
-    hdr->encoding = HLL_DENSE;
+    oldhdr = hdr;
+    hdr = createDenseHll(oldhdr->card);
+
+    int idx = 0, runlen, regval;
+    uint8_t *p = (uint8_t*)oldhdr + HLL_HDR_SIZE, *end = p + getSparseLen(oldhdr);
 
     /* Now read the sparse representation and set non-zero registers
      * accordingly. */
-    p += HLL_HDR_SIZE;
     while(p < end) {
         if (HLL_SPARSE_IS_ZERO(p)) {
             runlen = HLL_SPARSE_ZERO_LEN(p);
@@ -627,13 +725,13 @@ int hllSparseToDense(robj *o) {
     /* If the sparse representation was valid, we expect to find idx
      * set to HLL_REGISTERS. */
     if (idx != HLL_REGISTERS) {
-        sdsfree(dense);
+        releaseHll(hdr);
         return C_ERR;
     }
 
     /* Free the old representation and set the new one. */
-    sdsfree(o->ptr);
-    o->ptr = dense;
+    releaseHll(oldhdr);
+    o->ptr = hdr;
     return C_OK;
 }
 
@@ -667,12 +765,12 @@ int hllSparseSet(robj *o, long index, uint8_t count) {
      * into XZERO-VAL-XZERO). Make sure there is enough space right now
      * so that the pointers we take during the execution of the function
      * will be valid all the time. */
-    o->ptr = sdsMakeRoomFor(o->ptr,3);
+    o->ptr = sparseHllExpandSize(o->ptr,3);
 
     /* Step 1: we need to locate the opcode we need to modify to check
      * if a value update is actually needed. */
     sparse = p = ((uint8_t*)o->ptr) + HLL_HDR_SIZE;
-    end = p + sdslen(o->ptr) - HLL_HDR_SIZE;
+    end = p + getSparseLen(o->ptr);
 
     first = 0;
     prev = NULL; /* Points to previous opcode at the end of the loop. */
@@ -830,9 +928,9 @@ int hllSparseSet(robj *o, long index, uint8_t count) {
      int deltalen = seqlen-oldlen;
 
      if (deltalen > 0 &&
-         sdslen(o->ptr)+deltalen > server.hll_sparse_max_bytes) goto promote;
+         getSparseLen(o->ptr)+deltalen > server.hll_sparse_max_bytes) goto promote;
      if (deltalen && next) memmove(next+deltalen,next,end-next);
-     sdsIncrLen(o->ptr,deltalen);
+     sparseHllIncrLen(o->ptr,deltalen);
      memcpy(p,seq,seqlen);
      end += deltalen;
 
@@ -862,7 +960,7 @@ updated:
                 if (len <= HLL_SPARSE_VAL_MAX_LEN) {
                     HLL_SPARSE_VAL_SET(p+1,v1,len);
                     memmove(p,p+1,end-p);
-                    sdsIncrLen(o->ptr,-1);
+                    sparseHllIncrLen(o->ptr, -1);
                     end--;
                     /* After a merge we reiterate without incrementing 'p'
                      * in order to try to merge the just merged value with
@@ -1026,8 +1124,7 @@ uint64_t hllCount(struct hllhdr *hdr, int *invalid) {
     if (hdr->encoding == HLL_DENSE) {
         hllDenseRegHisto(hdr->registers,reghisto);
     } else if (hdr->encoding == HLL_SPARSE) {
-        hllSparseRegHisto(hdr->registers,
-                         sdslen((sds)hdr)-HLL_HDR_SIZE,invalid,reghisto);
+        hllSparseRegHisto(hdr->registers,getSparseLen(hdr),invalid,reghisto);
     } else if (hdr->encoding == HLL_RAW) {
         hllRawRegHisto(hdr->registers,reghisto);
     } else {
@@ -1078,10 +1175,9 @@ int hllMerge(uint8_t *max, robj *hll) {
             if (val > max[i]) max[i] = val;
         }
     } else {
-        uint8_t *p = hll->ptr, *end = p + sdslen(hll->ptr);
+        uint8_t *p = (uint8_t *)hll->ptr + HLL_HDR_SIZE, *end = p + getSparseLen(hll->ptr);
         long runlen, regval;
 
-        p += HLL_HDR_SIZE;
         i = 0;
         while(p < end) {
             if (HLL_SPARSE_IS_ZERO(p)) {
@@ -1110,71 +1206,34 @@ int hllMerge(uint8_t *max, robj *hll) {
 
 /* ========================== HyperLogLog commands ========================== */
 
-/* Create an HLL object. We always create the HLL using sparse encoding.
+/* Create an iniail  HLL object. We always create the HLL using sparse encoding.
  * This will be upgraded to the dense representation as needed. */
-robj *createHLLObject(void) {
+robj *createInitialHLLObject(void) {
     robj *o;
     struct hllhdr *hdr;
-    sds s;
     uint8_t *p;
-    int sparselen = HLL_HDR_SIZE +
-                    (((HLL_REGISTERS+(HLL_SPARSE_XZERO_MAX_LEN-1)) /
-                     HLL_SPARSE_XZERO_MAX_LEN)*2);
+    int sparse_datalen = ((HLL_REGISTERS+(HLL_SPARSE_XZERO_MAX_LEN-1)) /
+                     HLL_SPARSE_XZERO_MAX_LEN)*2;
     int aux;
 
     /* Populate the sparse representation with as many XZERO opcodes as
      * needed to represent all the registers. */
     aux = HLL_REGISTERS;
-    s = sdsnewlen(NULL,sparselen);
-    p = (uint8_t*)s + HLL_HDR_SIZE;
+    hdr = createSparseHll(sparse_datalen, 0, NULL);
+    p = (uint8_t*)hdr + HLL_HDR_SIZE;
     while(aux) {
         int xzero = HLL_SPARSE_XZERO_MAX_LEN;
         if (xzero > aux) xzero = aux;
         HLL_SPARSE_XZERO_SET(p,xzero);
         p += 2;
+        sparseHllIncrLen(hdr, 2);
         aux -= xzero;
     }
-    serverAssert((p-(uint8_t*)s) == sparselen);
+    serverAssert((p-(uint8_t*)hdr) == sparse_datalen + (int)HLL_HDR_SIZE);
 
     /* Create the actual object. */
-    o = createObject(OBJ_STRING,s);
-    hdr = o->ptr;
-    memcpy(hdr->magic,"HYLL",4);
-    hdr->encoding = HLL_SPARSE;
+    o = createObject(OBJ_HYPERLOGLOG, hdr);
     return o;
-}
-
-/* Check if the object is a String with a valid HLL representation.
- * Return C_OK if this is true, otherwise reply to the client
- * with an error and return C_ERR. */
-int isHLLObjectOrReply(client *c, robj *o) {
-    struct hllhdr *hdr;
-
-    /* Key exists, check type */
-    if (checkType(c,o,OBJ_STRING))
-        return C_ERR; /* Error already sent. */
-
-    if (!sdsEncodedObject(o)) goto invalid;
-    if (stringObjectLen(o) < sizeof(*hdr)) goto invalid;
-    hdr = o->ptr;
-
-    /* Magic should be "HYLL". */
-    if (hdr->magic[0] != 'H' || hdr->magic[1] != 'Y' ||
-        hdr->magic[2] != 'L' || hdr->magic[3] != 'L') goto invalid;
-
-    if (hdr->encoding > HLL_MAX_ENCODING) goto invalid;
-
-    /* Dense representation string length should match exactly. */
-    if (hdr->encoding == HLL_DENSE &&
-        stringObjectLen(o) != HLL_DENSE_SIZE) goto invalid;
-
-    /* All tests passed. */
-    return C_OK;
-
-invalid:
-    addReplyError(c,"-WRONGTYPE Key is not a valid "
-               "HyperLogLog string value.");
-    return C_ERR;
 }
 
 /* PFADD var ele ele ele ... ele => :0 or :1 */
@@ -1187,12 +1246,11 @@ void pfaddCommand(client *c) {
         /* Create the key with a string value of the exact length to
          * hold our HLL data structure. sdsnewlen() when NULL is passed
          * is guaranteed to return bytes initialized to zero. */
-        o = createHLLObject();
+        o = createInitialHLLObject();
         dbAdd(c->db,c->argv[1],o);
         updated++;
-    } else {
-        if (isHLLObjectOrReply(c,o) != C_OK) return;
-        o = dbUnshareStringValue(c->db,c->argv[1],o);
+    } else if (checkType(c, o, OBJ_HYPERLOGLOG)) {
+        return;
     }
     /* Perform the low level ADD operation for every element. */
     for (j = 2; j < c->argc; j++) {
@@ -1240,7 +1298,7 @@ void pfcountCommand(client *c) {
             /* Check type and size. */
             robj *o = lookupKeyRead(c->db,c->argv[j]);
             if (o == NULL) continue; /* Assume empty HLL for non existing var.*/
-            if (isHLLObjectOrReply(c,o) != C_OK) return;
+            if (checkType(c, o, OBJ_HYPERLOGLOG)) return;
 
             /* Merge with this HLL with our 'max' HLL by setting max[i]
              * to MAX(max[i],hll[i]). */
@@ -1272,8 +1330,7 @@ void pfcountCommand(client *c) {
          * we would have a key as HLLADD creates it as a side effect. */
         addReply(c,shared.czero);
     } else {
-        if (isHLLObjectOrReply(c,o) != C_OK) return;
-        o = dbUnshareStringValue(c->db,c->argv[1],o);
+        if (checkType(c, o, OBJ_HYPERLOGLOG)) return;
 
         /* Check if the cached cardinality is valid. */
         hdr = o->ptr;
@@ -1303,11 +1360,6 @@ void pfcountCommand(client *c) {
             hdr->card[5] = (card >> 40) & 0xff;
             hdr->card[6] = (card >> 48) & 0xff;
             hdr->card[7] = (card >> 56) & 0xff;
-            /* This is considered a read-only command even if the cached value
-             * may be modified and given that the HLL is a Redis string
-             * we need to propagate the change. */
-            signalModifiedKey(c,c->db,c->argv[1]);
-            server.dirty++;
         }
         addReplyLongLong(c,card);
     }
@@ -1328,7 +1380,7 @@ void pfmergeCommand(client *c) {
         /* Check type and size. */
         robj *o = lookupKeyRead(c->db,c->argv[j]);
         if (o == NULL) continue; /* Assume empty HLL for non existing var. */
-        if (isHLLObjectOrReply(c,o) != C_OK) return;
+        if (checkType(c, o, OBJ_HYPERLOGLOG)) return;
 
         /* If at least one involved HLL is dense, use the dense representation
          * as target ASAP to save time and avoid the conversion step. */
@@ -1349,13 +1401,8 @@ void pfmergeCommand(client *c) {
         /* Create the key with a string value of the exact length to
          * hold our HLL data structure. sdsnewlen() when NULL is passed
          * is guaranteed to return bytes initialized to zero. */
-        o = createHLLObject();
+        o = createInitialHLLObject();
         dbAdd(c->db,c->argv[1],o);
-    } else {
-        /* If key exists we are sure it's of the right type/size
-         * since we checked when merging the different HLLs, so we
-         * don't check again. */
-        o = dbUnshareStringValue(c->db,c->argv[1],o);
     }
 
     /* Convert the destination object to dense representation if at least
@@ -1395,8 +1442,7 @@ void pfmergeCommand(client *c) {
 #define HLL_TEST_CYCLES 1000
 void pfselftestCommand(client *c) {
     unsigned int j, i;
-    sds bitcounters = sdsnewlen(NULL,HLL_DENSE_SIZE);
-    struct hllhdr *hdr = (struct hllhdr*) bitcounters, *hdr2;
+    struct hllhdr *hdr = createDenseHll(NULL), *hdr2;
     robj *o = NULL;
     uint8_t bytecounters[HLL_REGISTERS];
 
@@ -1437,8 +1483,8 @@ void pfselftestCommand(client *c) {
      *
      * The test is performed with both dense and sparse HLLs at the same
      * time also verifying that the computed cardinality is the same. */
-    memset(hdr->registers,0,HLL_DENSE_SIZE-HLL_HDR_SIZE);
-    o = createHLLObject();
+    memset(hdr->registers,0,HLL_DENSE_REGISTERS_SIZE);
+    o = createInitialHLLObject();
     double relerr = 1.04/sqrt(HLL_REGISTERS);
     int64_t checkpoint = 1;
     uint64_t seed = (uint64_t)rand() | (uint64_t)rand() << 32;
@@ -1491,7 +1537,7 @@ void pfselftestCommand(client *c) {
     addReply(c,shared.ok);
 
 cleanup:
-    sdsfree(bitcounters);
+    releaseHll(hdr);
     if (o) decrRefCount(o);
 }
 
@@ -1513,8 +1559,7 @@ void pfdebugCommand(client *c) {
         addReplyError(c,"The specified key does not exist");
         return;
     }
-    if (isHLLObjectOrReply(c,o) != C_OK) return;
-    o = dbUnshareStringValue(c->db,c->argv[2],o);
+    if (checkType(c,o,OBJ_HYPERLOGLOG) != C_OK) return;
     hdr = o->ptr;
 
     /* PFDEBUG GETREG <key> */
@@ -1542,7 +1587,6 @@ void pfdebugCommand(client *c) {
     else if (!strcasecmp(cmd,"decode")) {
         if (c->argc != 3) goto arityerr;
 
-        uint8_t *p = o->ptr, *end = p+sdslen(o->ptr);
         sds decoded = sdsempty();
 
         if (hdr->encoding != HLL_SPARSE) {
@@ -1550,8 +1594,8 @@ void pfdebugCommand(client *c) {
             addReplyError(c,"HLL encoding is not sparse");
             return;
         }
+        uint8_t *p = (uint8_t *)hdr + HLL_HDR_SIZE, *end = p+getSparseLen(hdr);
 
-        p += HLL_HDR_SIZE;
         while(p < end) {
             int runlen, regval;
 
