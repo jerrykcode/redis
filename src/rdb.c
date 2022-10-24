@@ -682,8 +682,7 @@ int rdbSaveObjectType(rio *rdb, robj *o) {
         else
             serverPanic("Unknown hash encoding");
     case OBJ_HYPERLOGLOG:
-        //todo
-        break;
+        return rdbSaveType(rdb, RDB_TYPE_HYPERLOGLOG);
     case OBJ_STREAM:
         return rdbSaveType(rdb,RDB_TYPE_STREAM_LISTPACKS_2);
     case OBJ_MODULE:
@@ -941,7 +940,16 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid) {
             serverPanic("Unknown hash encoding");
         }
     } else if (o->type == OBJ_HYPERLOGLOG) {
-        //todo
+        hyperloglog hll = o->ptr;
+        int datalen = hllGetDataLen(hll);
+        if ((n = rdbSaveLen(rdb, datalen)) == -1) return -1;
+        nwritten += n;
+
+        if (rioWrite(rdb, &hll->encoding, 1) == 0) return -1;
+        nwritten++;
+
+        if ((n = rioWrite(rdb, hll->registers, datalen)) == -1)
+        nwritten += n;
     } else if (o->type == OBJ_STREAM) {
         /* Store how many listpacks we have inside the radix tree. */
         stream *s = o->ptr;
@@ -2053,6 +2061,17 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error) {
 
         /* All pairs should be read by now */
         serverAssert(len == 0);
+    } else if (rdbtype == RDB_TYPE_HYPERLOGLOG) {
+        if ((len = rdbLoadLen(rdb, NULL)) == RDB_LENERR) return NULL;
+        uint8_t encoding;
+        if (rioRead(rdb, &encoding, 1) == 0) return NULL;
+        hyperloglog hll = hllAlloc(len, encoding);
+        if (rioRead(rdb, hll->registers, len) == 0) {
+            hllRelease(hll);
+            return NULL;
+        }
+        o = createObject(OBJ_HYPERLOGLOG, hll);
+        o->encoding = OBJ_ENCODING_HYPERLOGLOG;
     } else if (rdbtype == RDB_TYPE_LIST_QUICKLIST || rdbtype == RDB_TYPE_LIST_QUICKLIST_2) {
         if ((len = rdbLoadLen(rdb,NULL)) == RDB_LENERR) return NULL;
         if (len == 0) goto emptykey;

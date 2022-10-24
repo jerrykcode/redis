@@ -90,24 +90,6 @@ start_server {tags {"repl external:skip"}} {
             r del key1 key2
         }
 
-        test {PFCOUNT updates cache on readonly replica} {
-            r select 5
-            assert {[r dbsize] == 0}
-            r pfadd key a b c d e f g h i j k l m n o p q
-            set strval [r get key]
-            r -1 select 5
-            wait_for_condition 50 100 {
-                [r -1 dbsize] == 1
-            } else {
-                fail "Replication timeout."
-            }
-            assert {$strval == [r -1 get key]}
-            assert_equal 17 [r -1 pfcount key]
-            assert {$strval != [r -1 get key]}; # cache updated
-            # cleanup
-            r del key
-        }
-
         test {PFCOUNT doesn't use expired key on readonly replica} {
             r select 5
             assert {[r dbsize] == 0}

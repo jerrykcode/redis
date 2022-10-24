@@ -81,6 +81,7 @@
 #define RDB_TYPE_MODULE_PRE_GA 6 /* Used in 4.0 release candidates */
 #define RDB_TYPE_MODULE_2 7 /* Module value with annotations for parsing without
                                the generating module being loaded. */
+#define RDB_TYPE_HYPERLOGLOG 8
 /* NOTE: WHEN ADDING NEW RDB TYPE, UPDATE rdbIsObjectType() BELOW */
 
 /* Object types for encoded objects. */
@@ -98,7 +99,7 @@
 /* NOTE: WHEN ADDING NEW RDB TYPE, UPDATE rdbIsObjectType() BELOW */
 
 /* Test if a type is an object type. */
-#define rdbIsObjectType(t) (((t) >= 0 && (t) <= 7) || ((t) >= 9 && (t) <= 19))
+#define rdbIsObjectType(t) (((t) >= 0 && (t) <= 19))
 
 /* Special RDB opcodes (saved/loaded with rdbSaveType/rdbLoadType). */
 #define RDB_OPCODE_FUNCTION2  245   /* function library data */

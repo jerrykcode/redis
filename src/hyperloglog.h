@@ -201,7 +201,10 @@ struct __attribute__ ((__packed__)) sparse_hllhdr {
     struct hllhdr hdr;/* Cached cardinality and encoding. */
 };
 
-struct hllhdr *createHll(uint16_t len, int encoding);
-void releaseHll(struct hllhdr *hdr);
+typedef struct hllhdr *hyperloglog;
+
+hyperloglog hllAlloc(uint16_t len, int encoding);
+void hllRelease(hyperloglog hll);
+int hllGetDataLen(hyperloglog hll);
 
 #endif

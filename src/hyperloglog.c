@@ -242,7 +242,7 @@ static char *invalid_hll_err = "-INVALIDOBJ Corrupted HLL object detected";
 
 /* Create a hyperloglog with dense representation. Set its cached cardinality
    to 'card' if 'card' is not NULL. */
-static struct hllhdr *createDenseHll(uint8_t *card) {
+static struct hllhdr *hllAllocForDense(uint8_t *card) {
     void *p = zmalloc(HLL_DENSE_SIZE);
     struct hllhdr *hdr = (struct hllhdr *)p;
     if (card)
@@ -256,7 +256,7 @@ static struct hllhdr *createDenseHll(uint8_t *card) {
 /* Create a hyperloglog with sparse representation. 'needlen' is the length of data
  * we need and 'len' is the length we actually used. 
  * We use realloc if 'ptr' is not NULL. */
-static struct hllhdr *createSparseHll(uint16_t needlen, uint16_t len, void *ptr) {
+static struct hllhdr *hllAllocForSparse(uint16_t needlen, uint16_t len, void *ptr) {
     size_t usable, alloc;
     /* Same as zmalloc_usable if 'ptr' is NULL. */
     ptr = zrealloc_usable(ptr, HLL_SPARSE_HDR_SIZE + needlen + 1, &usable);
@@ -275,13 +275,13 @@ static struct hllhdr *createSparseHll(uint16_t needlen, uint16_t len, void *ptr)
 }
 
 /* We can use this function to create a hyperloglog object from rdb file. */
-struct hllhdr *createHll(uint16_t len, int encoding) {
+hyperloglog hllAlloc(uint16_t len, int encoding) {
     struct hllhdr *hdr;
     if (encoding == HLL_DENSE) {
         serverAssert(len == HLL_DENSE_REGISTERS_SIZE);
-        hdr = createDenseHll(NULL);
+        hdr = hllAllocForDense(NULL);
     } else if (encoding == HLL_SPARSE) {
-        hdr = createSparseHll(len, len, NULL);
+        hdr = hllAllocForSparse(len, len, NULL);
     } else {
         serverPanic("Unknown hyperloglog encoding");
     }
@@ -310,17 +310,25 @@ static struct hllhdr *sparseHllExpandSize(struct hllhdr *hdr, uint16_t addlen) {
 
     uint16_t newlen = (oldlen + addlen) << 1; /* enlarge more than needed, to avoid need
                                                     for future reallocs on incremental growth. */
-    return createSparseHll(newlen, oldlen, shdr);
+    return hllAllocForSparse(newlen, oldlen, shdr);
 }
 
-void releaseHll(struct hllhdr *hdr) {
-    if (hdr->encoding == HLL_DENSE) {
-        zfree((void *)hdr);
-    } else if (hdr->encoding == HLL_SPARSE) {
-        zfree((void *)getSparseHdr(hdr));
+void hllRelease(hyperloglog hll) {
+    if (hll->encoding == HLL_DENSE) {
+        zfree((void *)hll);
+    } else if (hll->encoding == HLL_SPARSE) {
+        zfree((void *)getSparseHdr(hll));
     } else {
         serverPanic("Unknown hyperloglog encoding");
     }
+}
+
+int hllGetDataLen(hyperloglog hll) {
+    if (hll->encoding == HLL_DENSE)
+        return HLL_DENSE_REGISTERS_SIZE;
+    else if (hll->encoding == HLL_SPARSE)
+        return getSparseLen(hll);
+    else serverPanic("Unknown hyperloglog encoding");
 }
 
 /* ========================= HyperLogLog algorithm  ========================= */
@@ -523,7 +531,7 @@ int hllSparseToDense(robj *o) {
     if (hdr->encoding == HLL_DENSE) return C_OK;
 
     oldhdr = hdr;
-    hdr = createDenseHll(oldhdr->card);
+    hdr = hllAllocForDense(oldhdr->card);
 
     int idx = 0, runlen, regval;
     uint8_t *p = (uint8_t*)oldhdr + HLL_HDR_SIZE, *end = p + getSparseLen(oldhdr);
@@ -554,12 +562,12 @@ int hllSparseToDense(robj *o) {
     /* If the sparse representation was valid, we expect to find idx
      * set to HLL_REGISTERS. */
     if (idx != HLL_REGISTERS) {
-        releaseHll(hdr);
+        hllRelease(hdr);
         return C_ERR;
     }
 
     /* Free the old representation and set the new one. */
-    releaseHll(oldhdr);
+    hllRelease(oldhdr);
     o->ptr = hdr;
     return C_OK;
 }
@@ -1048,7 +1056,7 @@ robj *createInitialHLLObject(void) {
     /* Populate the sparse representation with as many XZERO opcodes as
      * needed to represent all the registers. */
     aux = HLL_REGISTERS;
-    hdr = createSparseHll(sparse_datalen, 0, NULL);
+    hdr = hllAllocForSparse(sparse_datalen, 0, NULL);
     p = (uint8_t*)hdr + HLL_HDR_SIZE;
     while(aux) {
         int xzero = HLL_SPARSE_XZERO_MAX_LEN;
@@ -1062,6 +1070,7 @@ robj *createInitialHLLObject(void) {
 
     /* Create the actual object. */
     o = createObject(OBJ_HYPERLOGLOG, hdr);
+    o->encoding = OBJ_ENCODING_HYPERLOGLOG;
     return o;
 }
 
@@ -1271,7 +1280,7 @@ void pfmergeCommand(client *c) {
 #define HLL_TEST_CYCLES 1000
 void pfselftestCommand(client *c) {
     unsigned int j, i;
-    struct hllhdr *hdr = createDenseHll(NULL), *hdr2;
+    struct hllhdr *hdr = hllAllocForDense(NULL), *hdr2;
     robj *o = NULL;
     uint8_t bytecounters[HLL_REGISTERS];
 
@@ -1366,7 +1375,7 @@ void pfselftestCommand(client *c) {
     addReply(c,shared.ok);
 
 cleanup:
-    releaseHll(hdr);
+    hllRelease(hdr);
     if (o) decrRefCount(o);
 }
 

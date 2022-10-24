@@ -346,7 +346,7 @@ void freeHashObject(robj *o) {
 }
 
 void freeHllObject(robj *o) {
-    //todo
+    hllRelease(o->ptr);
 }
 
 void freeModuleObject(robj *o) {
