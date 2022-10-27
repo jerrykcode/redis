@@ -314,7 +314,7 @@ void psetexCommand(client *c) {
 
 /* The getGenericCommand() function is called in order to implement GET, GETDEL and GETSET command.
  * If 'write' is zero, we use lookupKeyReadOrReply to look for the key and reply, otherwise we use
- * lookupKeyWriteOrReply(GETSET command use this). 
+ * lookupKeyWriteOrReply(GETDEL and GETSET command use this). 
  * If 'found' is not NULL, we set *found to 1 if we found the key, or 0 if the key doesn't exist. */
 int getGenericCommand(client *c, int write, int *found) {
     robj *o;
@@ -423,8 +423,10 @@ void getexCommand(client *c) {
 }
 
 void getdelCommand(client *c) {
-    if (getGenericCommand(c, 0, NULL) == C_ERR) return;
-    if (dbSyncDelete(c->db, c->argv[1])) {
+    int found;
+    /* We consider getdel as a write command, so use lookupKeyWrite() in get operation. */
+    if (getGenericCommand(c, 1, &found) == C_ERR) return;
+    if (found && dbSyncDelete(c->db, c->argv[1])) {
         /* Propagate as DEL command */
         rewriteClientCommandVector(c,2,shared.del,c->argv[1]);
         signalModifiedKey(c, c->db, c->argv[1]);
@@ -435,6 +437,7 @@ void getdelCommand(client *c) {
 
 void getsetCommand(client *c) {
     int found, setkey_flags;
+    /* We consider getset as a write command, so we use lookupWrite() in get operation. */
     if (getGenericCommand(c, 1, &found) == C_ERR) return;
     c->argv[2] = tryObjectEncoding(c->argv[2]);
     setkey_flags = found ? SETKEY_ALREADY_EXIST : SETKEY_DOESNT_EXIST;
