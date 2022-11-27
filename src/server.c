@@ -402,8 +402,8 @@ size_t dictEntryMetadataSize(dict *d) {
     return server.cluster_enabled ? sizeof(clusterDictEntryMetadata) : 0;
 }
 
-/* Generic hash table type where keys are Redis Objects, Values
- * dummy pointers. */
+/* Generic hash table type where keys are Redis Objects, Values dummy pointers or
+ * pointers acted as references, so val dup and val destructor set to NULL. */
 dictType objectKeyPointerValueDictType = {
     dictEncObjHash,            /* hash function */
     NULL,                      /* key dup */
