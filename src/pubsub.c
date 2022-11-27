@@ -226,24 +226,26 @@ int clientTotalPubSubSubscriptionCount(client *c) {
 /* Subscribe a client to a channel. Returns 1 if the operation succeeded, or
  * 0 if the client was already subscribed to that channel. */
 int pubsubSubscribeChannel(client *c, robj *channel, pubsubtype type) {
-    dictEntry *de;
+    dictEntry *deInClientDict, *deInServerDict;
     list *clients = NULL;
     int retval = 0;
 
     /* Add the channel to the client -> channels hash table */
-    if (dictAdd(type.clientPubSubChannels(c),channel,NULL) == DICT_OK) {
+    if ((deInClientDict = dictAddRaw(type.clientPubSubChannels(c),channel,NULL)) != NULL) {
         retval = 1;
         incrRefCount(channel);
         /* Add the client to the channel -> list of clients hash table */
-        de = dictFind(*type.serverPubSubChannels, channel);
-        if (de == NULL) {
+        deInServerDict = dictFind(*type.serverPubSubChannels, channel);
+        if (deInServerDict == NULL) {
             clients = listCreate();
             dictAdd(*type.serverPubSubChannels, channel, clients);
             incrRefCount(channel);
         } else {
-            clients = dictGetVal(de);
+            clients = dictGetVal(deInServerDict);
         }
         listAddNodeTail(clients,c);
+        /* client -> channels hash table maps channel to pointers of listnode in server hash table */
+        dictSetVal(type.clientPubSubChannels(c), deInClientDict, listLast(clients));
     }
     /* Notify the client */
     addReplyPubsubSubscribed(c,channel,type);
@@ -253,7 +255,7 @@ int pubsubSubscribeChannel(client *c, robj *channel, pubsubtype type) {
 /* Unsubscribe a client from a channel. Returns 1 if the operation succeeded, or
  * 0 if the client was not subscribed to the specified channel. */
 int pubsubUnsubscribeChannel(client *c, robj *channel, int notify, pubsubtype type) {
-    dictEntry *de;
+    dictEntry *deInClientDict, *deInServerDict;
     list *clients;
     listNode *ln;
     int retval = 0;
@@ -261,15 +263,17 @@ int pubsubUnsubscribeChannel(client *c, robj *channel, int notify, pubsubtype ty
     /* Remove the channel from the client -> channels hash table */
     incrRefCount(channel); /* channel may be just a pointer to the same object
                             we have in the hash tables. Protect it... */
-    if (dictDelete(type.clientPubSubChannels(c),channel) == DICT_OK) {
+    if ((deInClientDict = dictUnlink(type.clientPubSubChannels(c),channel)) != NULL) {
         retval = 1;
         /* Remove the client from the channel -> clients list hash table */
-        de = dictFind(*type.serverPubSubChannels, channel);
-        serverAssertWithInfo(c,NULL,de != NULL);
-        clients = dictGetVal(de);
-        ln = listSearchKey(clients,c);
+        deInServerDict = dictFind(*type.serverPubSubChannels, channel);
+        serverAssertWithInfo(c,NULL,deInServerDict != NULL);
+        clients = dictGetVal(deInServerDict);
+        ln = dictGetVal(deInClientDict); /* client dict maps channel to listnode in server dict */
         serverAssertWithInfo(c,NULL,ln != NULL);
         listDelNode(clients,ln);
+        /* client dict use objectKeyPointerValueDictType, with val destructor set to NULL, so ln will not be released again */
+        dictFreeUnlinkedEntry(type.clientPubSubChannels(c), deInClientDict);
         if (listLength(clients) == 0) {
             /* Free the list and associated hash entry at all if this was
              * the latest client, so that it will be possible to abuse
@@ -321,15 +325,29 @@ void pubsubShardUnsubscribeAllClients(robj *channel) {
 }
 
 
+/* We use a list instead of dict to save all the patterns subscribed by a client.
+ * When we subscribe a client to a pattern, we need to create 2 nodes: one to be linked in
+ * the list of patterns subscribed by this client and another node to be linked in the list
+ * of clients subscribing to this pattern (value of server.pubsub_patterns dict is the list).
+ * We save these two nodes together in the following structure, so that from one node we can
+ * reach the other in O(1) time WITHOUT having to traverse the list. */
+typedef struct compoundClientPatternNode {
+    listNode clientNode;
+    listNode patternNode;
+} compoundClientPatternNode;
+
 /* Subscribe a client to a pattern. Returns 1 if the operation succeeded, or 0 if the client was already subscribed to that pattern. */
 int pubsubSubscribePattern(client *c, robj *pattern) {
     dictEntry *de;
     list *clients;
+    compoundClientPatternNode *compound;
     int retval = 0;
 
     if (listSearchKey(c->pubsub_patterns,pattern) == NULL) {
         retval = 1;
-        listAddNodeTail(c->pubsub_patterns,pattern);
+        compound = zmalloc(sizeof(*compound));
+        compound->patternNode.value = pattern;
+        listLinkNodeTail(c->pubsub_patterns, &compound->patternNode);
         incrRefCount(pattern);
         /* Add the client to the pattern -> list of clients hash table */
         de = dictFind(server.pubsub_patterns,pattern);
@@ -340,7 +358,8 @@ int pubsubSubscribePattern(client *c, robj *pattern) {
         } else {
             clients = dictGetVal(de);
         }
-        listAddNodeTail(clients,c);
+        compound->clientNode.value = c;
+        listLinkNodeTail(clients, &compound->clientNode);
     }
     /* Notify the client */
     addReplyPubsubPatSubscribed(c,pattern);
@@ -348,29 +367,33 @@ int pubsubSubscribePattern(client *c, robj *pattern) {
 }
 
 /* Unsubscribe a client from a channel. Returns 1 if the operation succeeded, or
- * 0 if the client was not subscribed to the specified channel. */
-int pubsubUnsubscribePattern(client *c, robj *pattern, int notify) {
+ * 0 if the client was not subscribed to the specified channel.
+ * If ln is not NULL, ln is the listnode with this pattern in the list of patterns
+ * subscribed by the client. This is used by pubsubUnsubscribeAllPatterns() */
+int pubsubUnsubscribePattern(client *c, robj *pattern, listNode *ln, int notify) {
     dictEntry *de;
     list *clients;
-    listNode *ln;
+    compoundClientPatternNode *compound;
     int retval = 0;
 
     incrRefCount(pattern); /* Protect the object. May be the same we remove */
-    if ((ln = listSearchKey(c->pubsub_patterns,pattern)) != NULL) {
+    if (ln || (ln = listSearchKey(c->pubsub_patterns,pattern)) != NULL) {
         retval = 1;
-        listDelNode(c->pubsub_patterns,ln);
+        compound = redis_member2struct(compoundClientPatternNode, patternNode, ln);
+        listUnlinkNode(c->pubsub_patterns,ln);
         /* Remove the client from the pattern -> clients list hash table */
         de = dictFind(server.pubsub_patterns,pattern);
         serverAssertWithInfo(c,NULL,de != NULL);
         clients = dictGetVal(de);
-        ln = listSearchKey(clients,c);
+        ln = &compound->clientNode;
         serverAssertWithInfo(c,NULL,ln != NULL);
-        listDelNode(clients,ln);
+        listUnlinkNode(clients,ln);
         if (listLength(clients) == 0) {
             /* Free the list and associated hash entry at all if this was
              * the latest client. */
             dictDelete(server.pubsub_patterns,pattern);
         }
+        zfree(compound);
     }
     /* Notify the client */
     if (notify) addReplyPubsubPatUnsubscribed(c,pattern);
@@ -438,7 +461,7 @@ int pubsubUnsubscribeAllPatterns(client *c, int notify) {
     while ((ln = listNext(&li)) != NULL) {
         robj *pattern = ln->value;
 
-        count += pubsubUnsubscribePattern(c,pattern,notify);
+        count += pubsubUnsubscribePattern(c, pattern, ln, notify);
     }
     if (notify && count == 0) addReplyPubsubPatUnsubscribed(c,NULL);
     return count;
@@ -570,7 +593,7 @@ void punsubscribeCommand(client *c) {
         int j;
 
         for (j = 1; j < c->argc; j++)
-            pubsubUnsubscribePattern(c,c->argv[j],1);
+            pubsubUnsubscribePattern(c, c->argv[j], NULL, 1);
     }
     if (clientTotalPubSubSubscriptionCount(c) == 0) c->flags &= ~CLIENT_PUBSUB;
 }
