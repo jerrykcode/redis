@@ -1589,8 +1589,8 @@ void freeClient(client *c) {
     pubsubUnsubscribeShardAllChannels(c, 0);
     pubsubUnsubscribeAllPatterns(c,0);
     dictRelease(c->pubsub_channels);
+    serverAssert(listLength(c->pubsub_patterns) == 0); /* pubsubUnsubscribeAllPatterns() has already empty the list */
     listRelease(c->pubsub_patterns);
-    //zfree(c->pubsub_patterns);
     dictRelease(c->pubsubshard_channels);
 
     /* Free data structures. */
