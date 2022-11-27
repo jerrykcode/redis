@@ -340,14 +340,15 @@ typedef struct compoundClientPatternNode {
 int pubsubSubscribePattern(client *c, robj *pattern) {
     dictEntry *de;
     list *clients;
-    compoundClientPatternNode *compound;
+    //compoundClientPatternNode *compound;
     int retval = 0;
 
     if (listSearchKey(c->pubsub_patterns,pattern) == NULL) {
         retval = 1;
-        compound = zmalloc(sizeof(*compound));
-        compound->patternNode.value = pattern;
-        listLinkNodeTail(c->pubsub_patterns, &compound->patternNode);
+        //compound = zmalloc(sizeof(*compound));
+        //compound->patternNode.value = pattern;
+        //listLinkNodeTail(c->pubsub_patterns, &compound->patternNode);
+        listAddNodeTail(c->pubsub_patterns, pattern);
         incrRefCount(pattern);
         /* Add the client to the pattern -> list of clients hash table */
         de = dictFind(server.pubsub_patterns,pattern);
@@ -358,8 +359,9 @@ int pubsubSubscribePattern(client *c, robj *pattern) {
         } else {
             clients = dictGetVal(de);
         }
-        compound->clientNode.value = c;
-        listLinkNodeTail(clients, &compound->clientNode);
+        //compound->clientNode.value = c;
+        //listLinkNodeTail(clients, &compound->clientNode);
+        listAddNodeTail(clients, c);
     }
     /* Notify the client */
     addReplyPubsubPatSubscribed(c,pattern);
@@ -373,27 +375,30 @@ int pubsubSubscribePattern(client *c, robj *pattern) {
 int pubsubUnsubscribePattern(client *c, robj *pattern, listNode *ln, int notify) {
     dictEntry *de;
     list *clients;
-    compoundClientPatternNode *compound;
+    //compoundClientPatternNode *compound;
     int retval = 0;
 
     incrRefCount(pattern); /* Protect the object. May be the same we remove */
     if (ln || (ln = listSearchKey(c->pubsub_patterns,pattern)) != NULL) {
         retval = 1;
-        compound = redis_member2struct(compoundClientPatternNode, patternNode, ln);
-        listUnlinkNode(c->pubsub_patterns,ln);
+        //compound = redis_member2struct(compoundClientPatternNode, patternNode, ln);
+        //listUnlinkNode(c->pubsub_patterns,ln);
+        listDelNode(c->pubsub_patterns, ln);
         /* Remove the client from the pattern -> clients list hash table */
         de = dictFind(server.pubsub_patterns,pattern);
         serverAssertWithInfo(c,NULL,de != NULL);
         clients = dictGetVal(de);
-        ln = &compound->clientNode;
+        //ln = &compound->clientNode;
+        ln = listSearchKey(clients, c);
         serverAssertWithInfo(c,NULL,ln != NULL);
-        listUnlinkNode(clients,ln);
+        //listUnlinkNode(clients,ln);
+        listDelNode(clients, ln);
         if (listLength(clients) == 0) {
             /* Free the list and associated hash entry at all if this was
              * the latest client. */
             dictDelete(server.pubsub_patterns,pattern);
         }
-        zfree(compound);
+        //zfree(compound);
     }
     /* Notify the client */
     if (notify) addReplyPubsubPatUnsubscribed(c,pattern);
