@@ -1589,6 +1589,7 @@ void freeClient(client *c) {
     pubsubUnsubscribeShardAllChannels(c, 0);
     pubsubUnsubscribeAllPatterns(c,0);
     dictRelease(c->pubsub_channels);
+    serverAssert(listLength(c->pubsub_patterns) == 0);
     listRelease(c->pubsub_patterns);
     dictRelease(c->pubsubshard_channels);
 
