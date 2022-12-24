@@ -908,18 +908,56 @@ void ACLAddAllowedFirstArg(aclSelector *selector, unsigned long id, const char *
  *
  * If any of the operations are invalid, NULL will be returned instead
  * and errno will be set corresponding to the interior error. */
-aclSelector *aclCreateSelectorFromOpSet(const char *opset, size_t opsetlen) {
+aclSelector *aclCreateSelectorFromOpSet(user *u, const char *opset, size_t opsetlen) {
     serverAssert(opset[0] == '(' && opset[opsetlen - 1] == ')');
-    aclSelector *s = ACLCreateSelector(0);
+    aclSelector *s = ACLCreateSelector(0), *rootSelector = NULL;
 
-    int argc = 0;
+    int argc = 0, i = 0;
     sds trimmed = sdsnewlen(opset + 1, opsetlen - 2);
     sds *argv = sdssplitargs(trimmed, &argc);
-    for (int i = 0; i < argc; i++) {
+    /* Check if the first argument is '+@root'. */
+    if (argc && !strcasecmp(argv[0], "+@root")) {
+        s->flags |= SELECTOR_FLAG_INHERITS_ROOT_COMMANDS;
+        /* Inherits all the allowed commands from root selector. */
+        rootSelector = ACLUserGetRootSelector(u);
+        serverAssert(rootSelector->flags & SELECTOR_FLAG_ROOT);
+        if (rootSelector->flags & SELECTOR_FLAG_ALLCOMMANDS)
+            s->flags |= SELECTOR_FLAG_ALLCOMMANDS;
+        s->command_rules = sdsdup(rootSelector->command_rules);
+        memcpy(s->allowed_commands, rootSelector->allowed_commands, sizeof(s->allowed_commands));
+        /* Inherits allowed first-args if needed. */
+        s->allowed_firstargs = NULL;
+        if (rootSelector->allowed_firstargs) {
+            for (int j = 0; j < USER_COMMAND_BITS_COUNT; j++) {
+                if (!rootSelector->allowed_firstargs[j]) continue;
+                for (i = 0; rootSelector->allowed_firstargs[j][i]; i++)
+                    ACLAddAllowedFirstArg(s, j, rootSelector->allowed_firstargs[j][i]);
+            }
+        }
+        i = 1; /* Begin at argv[1] in the later for loop. */
+    }
+    /* Handle arguments. */
+    for (; i < argc; i++) {
         if (ACLSetSelector(s, argv[i], sdslen(argv[i])) == C_ERR) {
             ACLFreeSelector(s);
             s = NULL;
             goto cleanup;
+        }
+    }
+    /* Inherits all the key patterns from root selector if needed. */
+    if (s->flags & SELECTOR_FLAG_INHERITS_ROOT_KEYS) {
+        if (rootSelector == NULL) {
+            rootSelector = ACLUserGetRootSelector(u);
+            serverAssert(rootSelector->flags & SELECTOR_FLAG_ROOT);
+        }
+        if (rootSelector->flags & SELECTOR_FLAG_ALLKEYS)
+            s->flags |= SELECTOR_FLAG_ALLKEYS;
+        listIter li;
+        listNode *ln;
+        /* Add patterns to the begining of s->patterns in the same order in rootSelector->patterns. */
+        listRewindTail(rootSelector->patterns, &li);
+        while ((ln = listNext(&li)) != NULL) {
+            listAddNodeHead(s->patterns, ACLListDupKeyPattern(ln->value));
         }
     }
 
@@ -972,6 +1010,9 @@ int ACLSetSelector(aclSelector *selector, const char* op, size_t oplen) {
     {
         selector->flags |= SELECTOR_FLAG_ALLKEYS;
         listEmpty(selector->patterns);
+    } else if (!strcasecmp(op, "rootkeys") &&
+               !(selector->flags & SELECTOR_FLAG_ROOT)) {
+        selector->flags |= SELECTOR_FLAG_INHERITS_ROOT_KEYS;
     } else if (!strcasecmp(op,"resetkeys")) {
         selector->flags &= ~SELECTOR_FLAG_ALLKEYS;
         listEmpty(selector->patterns);
@@ -1274,7 +1315,7 @@ int ACLSetUser(user *u, const char *op, ssize_t oplen) {
             return C_ERR;
         }
     } else if (op[0] == '(' && op[oplen - 1] == ')') {
-        aclSelector *selector = aclCreateSelectorFromOpSet(op, oplen);
+        aclSelector *selector = aclCreateSelectorFromOpSet(u, op, oplen);
         if (!selector) {
             /* No errorno set, propagate it from interior error. */
             return C_ERR;

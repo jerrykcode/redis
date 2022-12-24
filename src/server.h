@@ -1067,6 +1067,8 @@ typedef struct readyList {
 #define SELECTOR_FLAG_ALLCOMMANDS (1<<2)    /* The user can run all commands. */
 #define SELECTOR_FLAG_ALLCHANNELS (1<<3)    /* The user can mention any Pub/Sub
                                                channel. */
+#define SELECTOR_FLAG_INHERITS_ROOT_COMMANDS (1<<4) /* The user inherits all the allowed commands from root selector. */
+#define SELECTOR_FLAG_INHERITS_ROOT_KEYS (1<<5) /* The user inherits all the keys from root selector. */
 
 typedef struct {
     sds name;       /* The username as an SDS string. */
