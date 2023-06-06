@@ -1021,6 +1021,11 @@ void scanGenericCommand(client *c, robj *o, unsigned long cursor) {
             vstr = lpGet(p,&vlen,intbuf);
             if (!use_pattern || stringmatchlen(pat, patlen, (char*)vstr, vlen, 0)) {
                 listAddNodeTail(keys, createStringObject((char*)vstr, vlen));
+                p = lpNext(o->ptr, p);
+                vstr = lpGet(p,&vlen,intbuf);
+                listAddNodeTail(keys, createStringObject((char*)vstr, vlen));
+            } else {
+                p = lpNext(o->ptr, p);
             }
             p = lpNext(o->ptr, p);
         }
