@@ -810,33 +810,54 @@ void keysCommand(client *c) {
     setDeferredArrayLen(c,replylen,numkeys);
 }
 
-/* This callback is used by scanGenericCommand in order to collect elements
+
+typedef struct scanCallbackPrivdata {
+    list *keys;
+    robj *o;
+    client *c;
+    sds pat;
+    int patlen;
+    sds typename;
+    long count;
+} scanCallbackPrivdata;
+
+/* This callback is used by scanGenericCommand in order to filter and collect elements
  * returned by the dictionary iterator into a list. */
 void scanCallback(void *privdata, const dictEntry *de) {
-    void **pd = (void**) privdata;
-    list *keys = pd[0];
-    robj *o = pd[1];
+    scanCallbackPrivdata *pd = (scanCallbackPrivdata *) privdata;
+    list *keys = pd->keys;
+    robj *o = pd->o;
     robj *key, *val = NULL;
+    
+    sds sdskey = dictGetKey(de);
+    if (pd->pat != NULL && !stringmatchlen(pd->pat, pd->patlen, sdskey, sdslen(sdskey), 0)) {
+        return;
+    }
 
+    key = createStringObject(sdskey, sdslen(sdskey));
     if (o == NULL) {
-        sds sdskey = dictGetKey(de);
-        key = createStringObject(sdskey, sdslen(sdskey));
-    } else if (o->type == OBJ_SET) {
-        sds keysds = dictGetKey(de);
-        key = createStringObject(keysds,sdslen(keysds));
+        if (expireIfNeeded(pd->c->db, key, 0)) {
+            decrRefCount(key);
+            return;
+        }
+        if (pd->typename != NULL) {
+            robj* typecheck = lookupKeyReadWithFlags(pd->c->db, key, LOOKUP_NOTOUCH);
+            char* type = getObjectTypeName(typecheck);
+            if (strcasecmp((char*) pd->typename, type)) {
+                decrRefCount(key);
+                return;
+            }
+        }
     } else if (o->type == OBJ_HASH) {
-        sds sdskey = dictGetKey(de);
         sds sdsval = dictGetVal(de);
-        key = createStringObject(sdskey,sdslen(sdskey));
         val = createStringObject(sdsval,sdslen(sdsval));
     } else if (o->type == OBJ_ZSET) {
-        sds sdskey = dictGetKey(de);
-        key = createStringObject(sdskey,sdslen(sdskey));
         val = createStringObjectFromLongDouble(*(double*)dictGetVal(de),0);
-    } else {
+    } else if (o->type != OBJ_SET) {
         serverPanic("Type not handled in SCAN callback.");
     }
 
+    pd->count++;
     listAddNodeTail(keys, key);
     if (val) listAddNodeTail(keys, val);
 }
@@ -940,15 +961,13 @@ void scanGenericCommand(client *c, robj *o, unsigned long cursor) {
         ht = o->ptr;
     } else if (o->type == OBJ_HASH && o->encoding == OBJ_ENCODING_HT) {
         ht = o->ptr;
-        count *= 2; /* We return key / value for this type. */
     } else if (o->type == OBJ_ZSET && o->encoding == OBJ_ENCODING_SKIPLIST) {
         zset *zs = o->ptr;
         ht = zs->dict;
-        count *= 2; /* We return key / value for this type. */
     }
 
     if (ht) {
-        void *privdata[2];
+        scanCallbackPrivdata privdata;
         /* We set the max number of iterations to ten times the specified
          * COUNT, so if the hash table is in a pathological state (very
          * sparsely populated) we avoid to block too much time at the cost
@@ -958,13 +977,18 @@ void scanGenericCommand(client *c, robj *o, unsigned long cursor) {
         /* We pass two pointers to the callback: the list to which it will
          * add new elements, and the object containing the dictionary so that
          * it is possible to fetch more data in a type-dependent way. */
-        privdata[0] = keys;
-        privdata[1] = o;
+        privdata.keys = keys;
+        privdata.o = o;
+        privdata.c = c;
+        privdata.pat = use_pattern ? pat : NULL;
+        privdata.patlen = use_pattern ? patlen : 0;
+        privdata.typename = typename;
+        privdata.count = 0;
         do {
-            cursor = dictScan(ht, cursor, scanCallback, privdata);
+            cursor = dictScan(ht, cursor, scanCallback, (void *)&privdata);
         } while (cursor &&
               maxiterations-- &&
-              listLength(keys) < (unsigned long)count);
+              privdata.count < count);
     } else if (o->type == OBJ_SET) {
         char *str;
         size_t len;
@@ -972,8 +996,14 @@ void scanGenericCommand(client *c, robj *o, unsigned long cursor) {
         setTypeIterator *si = setTypeInitIterator(o);
         while (setTypeNext(si, &str, &len, &llele) != -1) {
             if (str == NULL) {
+                if (use_pattern) {
+                    char buf[LONG_STR_SIZE];
+                    len = ll2string(buf, sizeof(buf), llele);
+                    if (!stringmatchlen(pat, patlen, buf, len, 0)) continue;
+                }
                 listAddNodeTail(keys, createStringObjectFromLongLong(llele));
             } else {
+                if (use_pattern && !stringmatchlen(pat, patlen, str, len, 0)) continue;
                 listAddNodeTail(keys, createStringObject(str, len));
             }
         }
@@ -989,69 +1019,17 @@ void scanGenericCommand(client *c, robj *o, unsigned long cursor) {
 
         while(p) {
             vstr = lpGet(p,&vlen,intbuf);
-            listAddNodeTail(keys, createStringObject((char*)vstr,vlen));
-            p = lpNext(o->ptr,p);
+            if (!use_pattern || stringmatchlen(pat, patlen, (char*)vstr, vlen, 0)) {
+                listAddNodeTail(keys, createStringObject((char*)vstr, vlen));
+            }
+            p = lpNext(o->ptr, p);
         }
         cursor = 0;
     } else {
         serverPanic("Not handled encoding in SCAN.");
     }
 
-    /* Step 3: Filter elements. */
-    node = listFirst(keys);
-    while (node) {
-        robj *kobj = listNodeValue(node);
-        nextnode = listNextNode(node);
-        int filter = 0;
-
-        /* Filter element if it does not match the pattern. */
-        if (use_pattern) {
-            if (sdsEncodedObject(kobj)) {
-                if (!stringmatchlen(pat, patlen, kobj->ptr, sdslen(kobj->ptr), 0))
-                    filter = 1;
-            } else {
-                char buf[LONG_STR_SIZE];
-                int len;
-
-                serverAssert(kobj->encoding == OBJ_ENCODING_INT);
-                len = ll2string(buf,sizeof(buf),(long)kobj->ptr);
-                if (!stringmatchlen(pat, patlen, buf, len, 0)) filter = 1;
-            }
-        }
-
-        /* Filter an element if it isn't the type we want. */
-        if (!filter && o == NULL && typename){
-            robj* typecheck = lookupKeyReadWithFlags(c->db, kobj, LOOKUP_NOTOUCH);
-            char* type = getObjectTypeName(typecheck);
-            if (strcasecmp((char*) typename, type)) filter = 1;
-        }
-
-        /* Filter element if it is an expired key. */
-        if (!filter && o == NULL && expireIfNeeded(c->db, kobj, 0)) filter = 1;
-
-        /* Remove the element and its associated value if needed. */
-        if (filter) {
-            decrRefCount(kobj);
-            listDelNode(keys, node);
-        }
-
-        /* If this is a hash or a sorted set, we have a flat list of
-         * key-value elements, so if this element was filtered, remove the
-         * value, or skip it if it was not filtered: we only match keys. */
-        if (o && (o->type == OBJ_ZSET || o->type == OBJ_HASH)) {
-            node = nextnode;
-            serverAssert(node); /* assertion for valgrind (avoid NPD) */
-            nextnode = listNextNode(node);
-            if (filter) {
-                kobj = listNodeValue(node);
-                decrRefCount(kobj);
-                listDelNode(keys, node);
-            }
-        }
-        node = nextnode;
-    }
-
-    /* Step 4: Reply to the client. */
+    /* Step 3: Reply to the client. */
     addReplyArrayLen(c, 2);
     addReplyBulkLongLong(c,cursor);
 
