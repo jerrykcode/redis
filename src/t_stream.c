@@ -387,6 +387,39 @@ void streamGetEdgeID(stream *s, int first, int skip_tombstones, streamID *edge_i
     streamIteratorStop(&si);
 }
 
+/* Return 1 if all fields match the master fields stored in lp. 
+ * This is a helper function for streamAppendItem().*/
+static inline int checkSameFields(robj **argv, int64_t numfields, unsigned char *lp) {
+    unsigned char *lp_ele = lpFirst(lp);
+
+    /* Skip the count and deleted fields. */
+    lp_ele = lpNext(lp,lp_ele);
+    lp_ele = lpNext(lp,lp_ele);
+
+    /* Check if the entry we are adding, have the same fields
+     * as the master entry. */
+    int64_t master_fields_count = lpGetInteger(lp_ele);
+    lp_ele = lpNext(lp,lp_ele);
+    if (numfields == master_fields_count) {
+        int64_t i;
+        for (i = 0; i < master_fields_count; i++) {
+            sds field = argv[i*2]->ptr;
+            int64_t e_len;
+            unsigned char buf[LP_INTBUF_SIZE];
+            unsigned char *e = lpGet(lp_ele,&e_len,buf);
+            /* Stop if there is a mismatch. */
+            if (sdslen(field) != (size_t)e_len ||
+                memcmp(e,field,e_len) != 0) break;
+            lp_ele = lpNext(lp,lp_ele);
+        }
+        /* All fields are the same! */
+        if (i == master_fields_count) { 
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* Adds a new item into the stream 's' having the specified number of
  * field-value pairs as specified in 'numfields' and stored into 'argv'.
  * Returns the new entry ID populating the 'added_id' structure.
@@ -445,10 +478,11 @@ int streamAppendItem(stream *s, robj **argv, int64_t numfields, streamID *added_
     /* Avoid overflow when trying to add an element to the stream (listpack
      * can only host up to 32bit length strings, and also a total listpack size
      * can't be bigger than 32bit length. */
-    size_t totelelen = 0;
-    for (int64_t i = 0; i < numfields*2; i++) {
-        sds ele = argv[i]->ptr;
-        totelelen += sdslen(ele);
+    size_t totelelen = 0, valueslen = 0;
+    for (int64_t i = 0; i < numfields; i++) {
+        sds field = argv[i*2]->ptr, value = argv[i*2+1]->ptr;
+        totelelen += sdslen(field) + sdslen(value);
+        valueslen += sdslen(value);
     }
     if (totelelen > STREAM_LISTPACK_MAX_SIZE) {
         errno = ERANGE;
@@ -508,6 +542,9 @@ int streamAppendItem(stream *s, robj **argv, int64_t numfields, streamID *added_
      * regular stream entries (see below), and marks the fact that there are
      * no more entries, when we scan the stream from right to left. */
 
+    /* Initialize entry flags */
+    int flags = STREAM_ITEM_FLAG_NONE;
+
     /* First of all, check if we can append to the current macro node or
      * if we need to switch to the next one. 'lp' will be set to NULL if
      * the current node is full. */
@@ -516,13 +553,21 @@ int streamAppendItem(stream *s, robj **argv, int64_t numfields, streamID *added_
         size_t node_max_bytes = server.stream_node_max_bytes;
         if (node_max_bytes == 0 || node_max_bytes > STREAM_LISTPACK_MAX_SIZE)
             node_max_bytes = STREAM_LISTPACK_MAX_SIZE;
-        if (lp_bytes + totelelen >= node_max_bytes) {
-            new_node = 1;
-        } else if (server.stream_node_max_entries) {
+        if (server.stream_node_max_entries) {
             unsigned char *lp_ele = lpFirst(lp);
             /* Count both live entries and deleted ones. */
             int64_t count = lpGetInteger(lp_ele) + lpGetInteger(lpNext(lp,lp_ele));
             if (count >= server.stream_node_max_entries) new_node = 1;
+        }
+        if (new_node == 0 && lp_bytes + totelelen >= node_max_bytes) {
+            new_node = 1;
+            /* If the fields match the master fields and there is still
+             * enough space to store only the values, a new node should
+             * not be allocated.*/
+            if (lp_bytes + valueslen < node_max_bytes && checkSameFields(argv, numfields, lp)) {
+                flags |= STREAM_ITEM_FLAG_SAMEFIELDS;
+                new_node = 0;
+            }
         }
 
         if (new_node) {
@@ -534,7 +579,6 @@ int streamAppendItem(stream *s, robj **argv, int64_t numfields, streamID *added_
         }
     }
 
-    int flags = STREAM_ITEM_FLAG_NONE;
     if (lp == NULL) {
         master_id = id;
         streamEncodeID(rax_key,&id);
@@ -567,33 +611,13 @@ int streamAppendItem(stream *s, robj **argv, int64_t numfields, streamID *added_
 
         /* Read the master ID from the radix tree key. */
         streamDecodeID(rax_key,&master_id);
+        /* Update count */
         unsigned char *lp_ele = lpFirst(lp);
-
-        /* Update count and skip the deleted fields. */
         int64_t count = lpGetInteger(lp_ele);
         lp = lpReplaceInteger(lp,&lp_ele,count+1);
-        lp_ele = lpNext(lp,lp_ele); /* seek deleted. */
-        lp_ele = lpNext(lp,lp_ele); /* seek master entry num fields. */
-
-        /* Check if the entry we are adding, have the same fields
-         * as the master entry. */
-        int64_t master_fields_count = lpGetInteger(lp_ele);
-        lp_ele = lpNext(lp,lp_ele);
-        if (numfields == master_fields_count) {
-            int64_t i;
-            for (i = 0; i < master_fields_count; i++) {
-                sds field = argv[i*2]->ptr;
-                int64_t e_len;
-                unsigned char buf[LP_INTBUF_SIZE];
-                unsigned char *e = lpGet(lp_ele,&e_len,buf);
-                /* Stop if there is a mismatch. */
-                if (sdslen(field) != (size_t)e_len ||
-                    memcmp(e,field,e_len) != 0) break;
-                lp_ele = lpNext(lp,lp_ele);
-            }
-            /* All fields are the same! We can compress the field names
-             * setting a single bit in the flags. */
-            if (i == master_fields_count) flags |= STREAM_ITEM_FLAG_SAMEFIELDS;
+        
+        if (!(flags & STREAM_ITEM_FLAG_SAMEFIELDS) && checkSameFields(argv, numfields, lp)) {
+            flags |= STREAM_ITEM_FLAG_SAMEFIELDS;
         }
     }
 
