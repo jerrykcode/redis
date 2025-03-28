@@ -1380,6 +1380,61 @@ unsigned char *lpDeleteRange(unsigned char *lp, long index, unsigned long num) {
     return lp;
 }
 
+unsigned char *lpDeleteItems(unsigned char *lp, int (*itemNeedDelete)(unsigned char *, uint32_t *, void *), void *user_data) {
+    size_t bytes = lpBytes(lp);
+    int need_delete;
+    uint32_t num, num_scanned, num_deleted, numele;
+    unsigned char *lp_ele, *eofptr, *cur_range_start, *cur_range_end, *del_range_start, *del_range_end;
+
+    lp_ele = lpFirst(lp);
+    eofptr = lp + bytes - 1;
+    del_range_start = del_range_end = NULL;
+    numele = lpGetNumElements(lp);
+    num_scanned = num_deleted = 0;
+    while (lp_ele[0] != LP_EOF) {
+        num = 0;
+        need_delete = itemNeedDelete(lp_ele, &num, user_data);
+        num_scanned += num;
+        assert(num_scanned <= numele);
+        cur_range_start = lp_ele;
+        for (size_t i = 0; i < num; i++) {
+            lp_ele = lpSkip(lp_ele);
+            if (lp_ele[0] == LP_EOF) {
+                assert(i == num -1 && num_scanned == numele);
+                break;
+            }
+            lpAssertValidEntry(lp, bytes, lp_ele);
+        }
+        cur_range_end = lp_ele;
+        if (!need_delete) {
+            continue;
+        }
+        num_deleted += num;
+        if (!del_range_start) {
+            del_range_start = cur_range_start;
+            del_range_end = cur_range_end;
+        } else {
+            assert(del_range_end && cur_range_start >= del_range_end);
+            size_t move_size = (size_t)(cur_range_start - del_range_end);
+            if (move_size) {
+                memmove(del_range_start, del_range_end, move_size);
+                del_range_start += move_size;
+            }
+            del_range_end = cur_range_end;
+        }
+    }
+    if (del_range_end) {
+        size_t move_size = eofptr - del_range_end + 1;
+        memmove(del_range_start, del_range_end, move_size);
+        del_range_start += move_size;
+    }
+    assert(del_range_start[0] == LP_EOF);
+    lpSetTotalBytes(lp, del_range_start - lpFirst(lp) + 1);
+    lpSetNumElements(lp, numele - num_deleted);
+    lp = lpShrinkToFit(lp);
+    return lp;
+}
+
 /* Delete the elements 'ps' passed as an array of 'count' element pointers and
  * return the resulting listpack. The elements must be given in the same order
  * as they apper in the listpack. */
