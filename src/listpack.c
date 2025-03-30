@@ -2527,7 +2527,7 @@ int listpackTest(int argc, char *argv[], int flags) {
         verifyEntry(lpSeek(lp, 2), (unsigned char *)"is", 2);
         verifyEntry(lpSeek(lp, 3), (unsigned char *)"test", 4);
         verifyEntry(lpSeek(lp, 4), (unsigned char *)"for", 3);
-        assert(lpGetNumElements(lp) == 5);
+        assert(lpGetNumElements(lp) == 888);
         lpFree(lp);
     }
 
