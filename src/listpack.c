@@ -1407,8 +1407,8 @@ unsigned char *lpIterationDelete(lpIterationDeleteContext *context, unsigned cha
         if (!del) {
             return next;
         }
+        assert(context->lp_num_ele >= 1);
         context->lp_num_ele--;
-        assert(context->lp_num_ele >= 0);
         if (p == context->delete_range_end) {
             context->delete_range_end = next;
         } else {
