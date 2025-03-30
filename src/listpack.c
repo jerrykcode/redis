@@ -1379,6 +1379,66 @@ unsigned char *lpDeleteRange(unsigned char *lp, long index, unsigned long num) {
 
     return lp;
 }
+/*
+ *
+ *  lpIterationDeleteContext context;
+ *  unsigned char *p = lpIterationDeleteStart(lp, &context);
+ *  while (p != NULL) {
+ *      if (needDel(p)) {
+ *          p = lpIterationDelete(&context, p, 1);
+ *      } else {
+ *          p = lpIterationDelete(&context, p, 0);
+ *      }
+ *  }
+ *  lp = lpIterationDeleteStop(&context);
+ *
+ * */
+unsigned char *lpIterationDeleteStart(unsigned char *lp, lpIterationDeleteContext *context) {
+    assert(context != NULL);
+    context->lp = lp;
+    context->lp_num_ele = lpGetNumElements(lp);
+    return context->delete_range_start = context->delete_range_end = lpFirst(lp);
+}
+
+unsigned char *lpIterationDelete(lpIterationDeleteContext *context, unsigned char *p, int del) {
+    unsigned char *lp = context->lp;
+    unsigned char *next = p;
+    if (lpValidateNext(lp, &next, lpBytes(lp))) {
+        if (!del) {
+            return next;
+        }
+        context->lp_num_ele--;
+        assert(context->lp_num_ele >= 0);
+        if (p == context->delete_range_end) {
+            context->delete_range_end = next;
+        } else {
+            assert(p > context->delete_range_end);
+            size_t move_size = p - context->delete_range_end;
+            if (context->delete_range_end > context->delete_range_start) {
+                memmove(context->delete_range_start, context->delete_range_end, move_size);
+            }
+            context->delete_range_start  += move_size;
+            context->delete_range_end = next;
+        }
+    } else {
+        return NULL;
+    }
+    return next;
+}
+
+unsigned char *lpIterationDeleteStop(lpIterationDeleteContext *context) {
+    unsigned char *lp = context->lp;
+    if (context->delete_range_end != lpFirst(lp)) {
+        size_t move_size = lp + lpBytes(lp) - context->delete_range_end;
+        memmove(context->delete_range_start, context->delete_range_end, move_size);
+        context->delete_range_start += move_size;
+        assert(context->delete_range_start[0] == LP_EOF);
+        lpSetTotalBytes(lp, context->delete_range_start - lpFirst(lp) + 1);
+        lpSetNumElements(lp, context->lp_num_ele);
+        lp = lpShrinkToFit(lp);
+    }
+    return lp;
+}
 
 /* Delete the elements 'ps' passed as an array of 'count' element pointers and
  * return the resulting listpack. The elements must be given in the same order
@@ -2412,6 +2472,63 @@ int listpackTest(int argc, char *argv[], int flags) {
         assert(lpLength(lp) == 1);
         verifyEntry(lpFirst(lp), (unsigned char*)mixlist[0], strlen(mixlist[0]));
         zfree(lp);
+    }
+
+    TEST("Delete in iteration: delete all elements");
+    {
+        lp = createList();
+        lpIterationDeleteContext context;
+        unsigned char *p = lpIterationDeleteStart(lp, &context);
+        while (p = lpIterationDelete(&context, p, 1));
+        lp = lpIterationDeleteStop(&context);
+        assert(lpGetNumElements(lp) == 0);
+        lpFree(lp);
+    }
+
+    TEST("Delete in iteration: delete first and last elements");
+    {
+        lp = createList();
+        lpIterationDeleteContext context;
+        unsigned char *p = lpIterationDeleteStart(lp, &context);
+        while (p != NULL) {
+            int del = lpCompare(p, mixlist[0], strlen(mixlist[0])) || lpCompare(p, mixlist[3], strlen(mixlist[3]));
+            p = lpIterationDelete(&context, p, del);
+        }
+        lp = lpIterationDeleteStop(&context);
+        assert(lpGetNumElements(lp) == 2);
+        unsigned char *p = lpFirst(lp);
+        for (int i = 1; i <= 2; i++) {
+            verifyEntry(p, mixlist[i], strlen(mixlist[i]));
+            p = lpNext(lp, p);
+        }
+        assert(p == NULL);
+        lpFree(lp);
+    }
+
+    TEST("Delete in iteration: delete consecutive ranges"); 
+    {
+        char *list[] = {"Hello", "-100", "100", "1024", "127", "0", "This", "is", "a", "test", "for", "deleting", "consecutive", "ranges", "!"}; // 15 items
+        int *dels[]  = {1,        1,      1,     0,      0,     1,   1,      0,    1,   0,      0,     1,          1,             1,        1};
+        lp = lpNew(0);
+        for (int i = 0; i < 15; i++) {
+            lp = lpAppend(lp, (unsigned char *)list[i], strlen(list[i]));
+        }
+        lpIterationDeleteContext context;
+        unsigned char *p = lpIterationDeleteStart(lp, &context);
+        int i = 0;
+        while (p != NULL) {
+            p = lpIterationDelete(&context, p, dels[i]);
+            i++;
+        }
+        assert(i == 15);
+        lp = lpIterationDeleteStop(&context);
+        verifyEntry(lpSeek(lp, 0), (unsigned char *)"1024", 4);
+        verifyEntry(lpSeek(lp, 1), (unsigned char *)"127", 3);
+        verifyEntry(lpSeek(lp, 2), (unsigned char *)"is", 2);
+        verifyEntry(lpSeek(lp, 3), (unsigned char *)"test", 4);
+        verifyEntry(lpSeek(lp, 4), (unsigned char *)"for", 3);
+        assert(lpGetNumElements(lp) == 5);
+        lpFree(lp);
     }
 
     TEST("Batch append") {
