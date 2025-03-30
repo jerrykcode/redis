@@ -33,6 +33,12 @@ typedef struct {
     long long lval;
 } listpackEntry;
 
+typedef struct {
+    unsigned char *lp;
+    unsigned char *delete_range_start, *delete_range_end;
+    size_t lp_num_ele;
+} lpIterationDeleteContext;
+
 unsigned char *lpNew(size_t capacity);
 void lpFree(unsigned char *lp);
 void lpFreeGeneric(void *lp);
@@ -50,7 +56,9 @@ unsigned char *lpReplaceInteger(unsigned char *lp, unsigned char **p, long long 
 unsigned char *lpDelete(unsigned char *lp, unsigned char *p, unsigned char **newp);
 unsigned char *lpDeleteRangeWithEntry(unsigned char *lp, unsigned char **p, unsigned long num);
 unsigned char *lpDeleteRange(unsigned char *lp, long index, unsigned long num);
-unsigned char *lpDeleteItems(unsigned char *lp, int (*itemNeedDelete)(unsigned char *, uint32_t *, void *), void *user_data);
+unsigned char *lpIterationDeleteStart(unsigned char *lp, lpIterationDeleteContext *context);
+unsigned char *lpIterationDelete(lpIterationDeleteContext *context, unsigned char *p, int del);
+unsigned char *lpIterationDeleteStop(lpIterationDeleteContext *context);
 unsigned char *lpBatchAppend(unsigned char *lp, listpackEntry *entries, unsigned long len);
 unsigned char *lpBatchInsert(unsigned char *lp, unsigned char *p, int where,
                              listpackEntry *entries, unsigned int len, unsigned char **newp);
