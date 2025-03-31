@@ -1335,21 +1335,21 @@ void listpackRemoveDeletedEntry(unsigned char *lp, lpIterationDeleteContext *con
         flags = lpGetInteger(p);
         del = flags & STREAM_ITEM_FLAG_DELETED;
         for (int i = 0; i < 2; i++) { /* Delete or skip 2 fields: flags and entry-id */
-            p = del ? lpDeleteInIterCtx(context) : lpNext(lp, p);
+            p = del ? lpDeleteInIterCtx(context, p) : lpNext(lp, p);
         }
         if (flags & STREAM_ITEM_FLAG_SAMEFIELDS) {
             num_fields = master_num_fields;
         } else {
             num_fields = lpGetInteger(p);
-            p = del ? lpDeleteInIterCtx(context) : lpNext(lp, p);
+            p = del ? lpDeleteInIterCtx(context, p) : lpNext(lp, p);
         }
         for (int i = 0; i < num_fields; i++) {
-            p = del ? lpDeleteInIterCtx(context) : lpNext(lp, p);
+            p = del ? lpDeleteInIterCtx(context, p) : lpNext(lp, p);
             if (flags & STREAM_ITEM_FLAG_SAMEFIELDS) {
-                p = del ? lpDeleteInIterCtx(context) : lpNext(lp, p);
+                p = del ? lpDeleteInIterCtx(context, p) : lpNext(lp, p);
             }
         }
-        p = del ? lpDeleteInIterCtx(context) : lpNext(lp, p); /* lp-count */
+        p = del ? lpDeleteInIterCtx(context, p) : lpNext(lp, p); /* lp-count */
     }
 }
 
