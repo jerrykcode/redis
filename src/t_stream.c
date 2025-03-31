@@ -838,6 +838,7 @@ int64_t streamTrim(stream *s, streamAddTrimArgs *args) {
         marked_deleted += deleted_from_lp;
         if (entries + marked_deleted > 10 && marked_deleted > entries/2) {
             /* TODO: perform a garbage collection. */
+            lp = lpIterationDelete(lp, listpackRemoveDeletedEntry, NULL);
         }
 
         /* Update the listpack with the new pointer. */
@@ -1258,7 +1259,7 @@ void streamIteratorGetField(streamIterator *si, unsigned char **fieldptr, unsign
  * with GetID(). */
 void streamIteratorRemoveEntry(streamIterator *si, streamID *current) {
     unsigned char *lp = si->lp;
-    int64_t aux;
+    int64_t valid, deleted;
 
     /* We do not really delete the entry here. Instead we mark it as
      * deleted by flagging it, and also incrementing the count of the
@@ -1271,19 +1272,24 @@ void streamIteratorRemoveEntry(streamIterator *si, streamID *current) {
 
     /* Change the valid/deleted entries count in the master entry. */
     unsigned char *p = lpFirst(lp);
-    aux = lpGetInteger(p);
+    valid = lpGetInteger(p);
 
-    if (aux == 1) {
+    if (valid == 1) {
         /* If this is the last element in the listpack, we can remove the whole
          * node. */
         lpFree(lp);
         raxRemove(si->stream->rax,si->ri.key,si->ri.key_len,NULL);
     } else {
         /* In the base case we alter the counters of valid/deleted entries. */
-        lp = lpReplaceInteger(lp,&p,aux-1);
+        valid--;
+        lp = lpReplaceInteger(lp,&p,valid);
         p = lpNext(lp,p); /* Seek deleted field. */
-        aux = lpGetInteger(p);
-        lp = lpReplaceInteger(lp,&p,aux+1);
+        deleted = lpGetInteger(p);
+        deleted++;
+        lp = lpReplaceInteger(lp,&p,deleted);
+        if (deleted >= valid) {
+            lp = lpIterationDelete(lp, listpackRemoveDeletedEntry, NULL);
+        }
 
         /* Update the listpack with the new pointer. */
         if (si->lp != lp)
@@ -1307,6 +1313,43 @@ void streamIteratorRemoveEntry(streamIterator *si, streamID *current) {
 
     /* TODO: perform a garbage collection here if the ratio between
      * deleted and valid goes over a certain limit. */
+}
+
+void listpackRemoveDeletedEntry(unsigned char *lp, lpIterationDeleteContext *context, void *arg) {
+    unsigned char *p = lpFirst(lp);
+    int64_t count, deleted, total, master_num_fields, num_fields;
+    count = lpGetInteger(p);
+    p = lpNext(lp, p);
+    deleted = lpGetInteger(p);
+    total = count + deleted;
+    assert(total >= 0);
+    p = lpNext(lp, p);
+    master_num_fields = lpGetInteger(p);
+    /* Skip num-fields field and master fields and end 0 */
+    for (int i = 0; i < master_num_fields + 2; i++) {
+        p = lpSkip(p);
+    }
+    int flags, del;
+    while (total--) {
+        flags = lpGetInteger(p);
+        del = flags & STREAM_ITEM_FLAG_DELETED;
+        for (int i = 0; i < 2; i++) { /* Delete or skip 2 fields: flags and entry-id */
+            p = del ? lpDeleteInIterCtx(context) : lpNext(lp, p);
+        }
+        if (flags & STREAM_ITEM_FLAG_SAMEFIELDS) {
+            num_fields = master_num_fields;
+        } else {
+            num_fields = lpGetInteger(p);
+            p = del ? lpDeleteInIterCtx(context) : lpNext(lp, p);
+        }
+        for (int i = 0; i < num_fields; i++) {
+            p = del ? lpDeleteInIterCtx(context) : lpNext(lp, p);
+            if (flags & STREAM_ITEM_FLAG_SAMEFIELDS) {
+                p = del ? lpDeleteInIterCtx(context) : lpNext(lp, p);
+            }
+        }
+        p = del ? lpDeleteInIterCtx(context) : lpNext(lp, p); /* lp-count */
+    }
 }
 
 /* Stop the stream iterator. The only cleanup we need is to free the rax
