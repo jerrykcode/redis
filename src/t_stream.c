@@ -1316,6 +1316,7 @@ void streamIteratorRemoveEntry(streamIterator *si, streamID *current) {
 }
 
 void listpackRemoveDeletedEntry(unsigned char *lp, lpIterationDeleteContext *context, void *arg) {
+    (void)arg;
     unsigned char *p = lpFirst(lp);
     int64_t count, deleted, total, master_num_fields, num_fields;
     count = lpGetInteger(p);
