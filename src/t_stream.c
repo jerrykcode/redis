@@ -1323,21 +1323,22 @@ void listpackRemoveDeletedEntry(unsigned char *lp, lpIterationDeleteContext *con
     p = lpNext(lp, p);
     deleted = lpGetInteger(p);
     total = count + deleted;
-    assert(total >= 0);
+    serverAssert(total >= 0);
     p = lpNext(lp, p);
     master_num_fields = lpGetInteger(p);
     /* Skip num-fields field and master fields and end 0 */
     for (int i = 0; i < master_num_fields + 2; i++) {
-        p = lpSkip(p);
+        p = lpNext(lp, p);
     }
-    int flags, del;
+    int flags, del, same_fields;
     while (total--) {
         flags = lpGetInteger(p);
         del = flags & STREAM_ITEM_FLAG_DELETED;
+        same_fields = flags & STREAM_ITEM_FLAG_SAMEFIELDS;
         for (int i = 0; i < 2; i++) { /* Delete or skip 2 fields: flags and entry-id */
             p = del ? lpDeleteInIterCtx(context, p) : lpNext(lp, p);
         }
-        if (flags & STREAM_ITEM_FLAG_SAMEFIELDS) {
+        if (same_fields) {
             num_fields = master_num_fields;
         } else {
             num_fields = lpGetInteger(p);
@@ -1345,7 +1346,7 @@ void listpackRemoveDeletedEntry(unsigned char *lp, lpIterationDeleteContext *con
         }
         for (int i = 0; i < num_fields; i++) {
             p = del ? lpDeleteInIterCtx(context, p) : lpNext(lp, p);
-            if (flags & STREAM_ITEM_FLAG_SAMEFIELDS) {
+            if (!same_fields) {
                 p = del ? lpDeleteInIterCtx(context, p) : lpNext(lp, p);
             }
         }
