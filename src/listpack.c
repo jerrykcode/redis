@@ -1390,16 +1390,22 @@ unsigned char *lpDeleteRange(unsigned char *lp, long index, unsigned long num) {
  * We delete the specified ranges and preserve the bytes between these ranges by moving them 
  * to the end of the preserved region.
  */
-unsigned char *lpDeleteRanges(unsigned char *lp, unsigned char *p, uint32_t (*getNextRange)(unsigned char *, unsigned char *, unsigned char **, void *), void *arg) {
+unsigned char *lpDeleteRanges(unsigned char *lp, unsigned char *p, uint32_t (*getNextRange)(unsigned char *, unsigned char *, unsigned char **, int *, void *), void *arg) {
     unsigned char *preserved_end, *range_start, *eofptr;
     size_t bytes = lpBytes(lp), move_size;
     uint32_t numele = lpGetNumElements(lp), range_ele;
+    int cancel = 0, has_moved = 0;
     lpAssertValidEntry(lp, bytes, p);
     preserved_end = range_start = NULL;
     eofptr = lp + bytes - 1;
     while (p[0] != LP_EOF) {
-        range_ele = getNextRange(lp, p, &range_start, arg);
+        range_ele = getNextRange(lp, p, &range_start, &cancel, arg);
         assert(numele >= range_ele);
+        if (cancel == 1) {
+            assert(!has_moved);
+            /* Cancel the deletion. */
+            return lp;
+        }
         if (range_start == NULL) {
             /* No more deleted range. */
             break;
@@ -1415,6 +1421,7 @@ unsigned char *lpDeleteRanges(unsigned char *lp, unsigned char *p, uint32_t (*ge
             move_size = range_start - p;
             memmove(preserved_end, p, move_size);
             preserved_end += move_size;
+            has_moved = 1;
         }
         /* Move p to the first byte after the deleted range and continue searching for the next range
          * to delete in the next loop. */
@@ -2115,7 +2122,8 @@ static unsigned char *createIntList(void) {
 }
 
 /* Callback function for lpDeleteRanges(), it can be used to delete ranges in intlist */
-static uint32_t deleteAllPositiveIntegers(unsigned char *lp, unsigned char *p, unsigned char **range_start, void *arg) {
+static uint32_t deleteAllPositiveIntegers(unsigned char *lp, unsigned char *p, unsigned char **range_start, int *cancel, void *arg) {
+    (void)cancel;
     (void)arg;
     long long val;
     unsigned char *last = lpLast(lp);
@@ -2134,7 +2142,8 @@ static uint32_t deleteAllPositiveIntegers(unsigned char *lp, unsigned char *p, u
 }
 
 /* Callback functions for lpDeleteRanges(), they can be used to delete ranges in mixlist */
-static uint32_t delete1stTo3rdRange(unsigned char *lp, unsigned char *p, unsigned char **range_start, void *arg) {
+static uint32_t delete1stTo3rdRange(unsigned char *lp, unsigned char *p, unsigned char **range_start, int *cancel, void *arg) {
+    (void)cancel;
     (void)lp;
     int *deleted = (int *)arg;
     /* Only one range to delete in this case. We use 'deleted' to ensure the range is returned only once. */
@@ -2146,7 +2155,8 @@ static uint32_t delete1stTo3rdRange(unsigned char *lp, unsigned char *p, unsigne
     *range_start = NULL;
     return 0;
 }
-static uint32_t delete1stAnd3rdItems(unsigned char *lp, unsigned char *p, unsigned char **range_start, void *arg) {
+static uint32_t delete1stAnd3rdItems(unsigned char *lp, unsigned char *p, unsigned char **range_start, int *cancel, void *arg) {
+    (void)cancel;
     int *idx = (int *)arg;
     while (1) {
         (*idx)++;
@@ -2161,7 +2171,8 @@ static uint32_t delete1stAnd3rdItems(unsigned char *lp, unsigned char *p, unsign
     return 0;
 }
 
-static uint32_t delete1stAnd2ndAnd4thItems(unsigned char *lp, unsigned char *p, unsigned char **range_start, void *arg) {
+static uint32_t delete1stAnd2ndAnd4thItems(unsigned char *lp, unsigned char *p, unsigned char **range_start, int *cancel, void *arg) {
+    (void)cancel;
     int *idx = (int *)arg;
     while (1) {
         (*idx)++;
@@ -2181,7 +2192,8 @@ static uint32_t delete1stAnd2ndAnd4thItems(unsigned char *lp, unsigned char *p, 
     return 0;
 }
 
-static uint32_t deleteAll(unsigned char *lp, unsigned char *p, unsigned char **range_start, void *arg) {
+static uint32_t deleteAll(unsigned char *lp, unsigned char *p, unsigned char **range_start, int *cancel, void *arg) {
+    (void)cancel;
     (void)arg;
     if (p == lpFirst(lp)) {
         *range_start = p;
@@ -2189,6 +2201,21 @@ static uint32_t deleteAll(unsigned char *lp, unsigned char *p, unsigned char **r
     }
     *range_start = NULL;
     return 0;
+}
+
+static uint32_t cancelDeletion(unsigned char *lp, unsigned char *p, unsigned char **range_start, int *cancel, void *arg) {
+     (void)lp;
+    int *idx = (int *)arg;
+    if (*idx < 3) {
+        *range_start = p;
+        (*idx)++;
+        return 1;
+    }
+    /* Cancel the deletion of previous ranges*/
+    *cancel = 1;
+    *range_start = NULL;
+    return 0;
+
 }
 
 static long long usec(void) {
@@ -2638,6 +2665,14 @@ int listpackTest(int argc, char *argv[], int flags) {
         lp = lpDeleteRanges(lp, lpFirst(lp), deleteAllPositiveIntegers, NULL);
         assert(lpLength(lp) == 0);
         zfree(lp);
+    }
+
+    TEST("Delete ranges: cancel deletion") {
+        lp = createList();
+        assert(lpLength(lp) == 4);
+        int idx = 0;
+        assert(lp == lpDeleteRanges(lp, lpFirst(lp), cancelDeletion, (void *)&idx));
+        assert(lpLength(lp) == 4);
     }
 
     TEST("Batch append") {
