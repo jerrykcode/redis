@@ -1389,6 +1389,9 @@ unsigned char *lpDeleteRange(unsigned char *lp, long index, unsigned long num) {
  * delete, the output pointer is set to NULL and return 0.
  * We delete the specified ranges and preserve the bytes between these ranges by moving them 
  * to the end of the preserved region.
+ * The deletion process can be aborted by setting cancel to 1 in the callback, but this is only
+ * valid if no bytes have been moved — i.e., all previously deleted ranges are contiguous and 
+ * form a single large range.
  */
 unsigned char *lpDeleteRanges(unsigned char *lp, unsigned char *p, uint32_t (*getNextRange)(unsigned char *, unsigned char *, unsigned char **, int *, void *), void *arg) {
     unsigned char *preserved_end, *range_start, *eofptr;
