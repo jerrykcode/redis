@@ -3817,7 +3817,7 @@ void xinfoReplyWithStreamInfo(client *c, stream *s) {
     addReplyStreamID(c,&s->last_id);
     addReplyBulkCString(c,"max-deleted-entry-id");
     addReplyStreamID(c,&s->max_deleted_entry_id);
-    addReplyBulkCString(c,"entrses-added");
+    addReplyBulkCString(c,"entries-added");
     addReplyLongLong(c,s->entries_added);
     addReplyBulkCString(c,"recorded-first-entry-id");
     addReplyStreamID(c,&s->first_id);
