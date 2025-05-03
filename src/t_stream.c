@@ -677,6 +677,7 @@ typedef struct {
 #define TRIM_STRATEGY_MAXLEN 1
 #define TRIM_STRATEGY_MINID 2
 
+/* Used in callback for lpDeleteRanges() */
 struct trimContext {
     int perform_garbage_collection;
     int processed_all_trimmed_entries;
@@ -1347,6 +1348,17 @@ static uint32_t listpackGetNextDeletedRange(unsigned char *lp, unsigned char *p,
     return 0;
 }
 
+/*
+ * This callback is used in xtrim to handle deletion of listpack items that correspond
+ * to entries needing trimming, or that were previously marked as STREAM_ITEM_FLAG_DELETED
+ * if garbage collection is required. If garbage collection is not needed, the deletion is
+ * canceled, but all trimmed entries are still marked as STREAM_ITEM_FLAG_DELETED.
+
+ * Marking entries with STREAM_ITEM_FLAG_DELETED does not change the encoding of the flag
+ * integer, ensuring the listpack is not reallocated and remains safe. However, if the
+ * encoding were to change in the future (e.g., due to modifications in the flag format),
+ * the flag is left unchanged and garbage collection is performed instead as a fallback.
+ */
 static uint32_t listpackGetNextDeletedRangeInXTrim(unsigned char *lp, unsigned char *p, unsigned char **range_start, int *cancel, void *arg) {
     struct trimContext *context = (struct trimContext *)arg;
     if (context->processed_all_trimmed_entries) {
@@ -1382,9 +1394,11 @@ static uint32_t listpackGetNextDeletedRangeInXTrim(unsigned char *lp, unsigned c
          * of listpack items constituting this entry is returned.*/
         if (!(flags & STREAM_ITEM_FLAG_DELETED)) {
             flags |= STREAM_ITEM_FLAG_DELETED;
-            /* We update the flag since it's still unclear whether garbage collection is needed.
-             * The flag's length remains unchanged, so the listpack (lp) won't be modified.*/
-            serverAssert(lp == lpReplaceInteger(lp, &pcopy, flags));
+            /* We update the flag since it's still unclear whether garbage collection is needed. */
+            if (unlikely(!lpReplaceIntegerSameLen(lp, pcopy, flags))) {
+                /* We do not want lp change to another pointer, perform a garbage collection. */
+                context->perform_garbage_collection = 1;
+            }
             context->num_deleted_by_trim++;
             context->s->length--;
         }
@@ -1406,7 +1420,8 @@ static uint32_t listpackGetNextDeletedRangeInXTrim(unsigned char *lp, unsigned c
      * (Safe to do: trimmed entries are contiguous at the beginning, and no bytes have been moved.) */
     context->num_deleted += context->num_deleted_by_trim;
     context->num_entries -= context->num_deleted_by_trim;
-    if (context->num_entries + context->num_deleted > 10 && context->num_deleted > context->num_entries/2) {
+    if (context->perform_garbage_collection
+            || (context->num_entries + context->num_deleted > 10 && context->num_deleted > context->num_entries/2)) {
         context->perform_garbage_collection = 1;
         context->processed_all_trimmed_entries = 1;
         return listpackGetNextDeletedRange(lp, pcopy, range_start, cancel, &(context->master_fields));

@@ -23,6 +23,7 @@
 #define LP_BEFORE 0
 #define LP_AFTER 1
 #define LP_REPLACE 2
+#define LP_REPLACE_SAME_LEN 4
 
 /* Each entry in the listpack is either a string or an integer. */
 typedef struct {
@@ -47,6 +48,7 @@ unsigned char *lpAppend(unsigned char *lp, unsigned char *s, uint32_t slen);
 unsigned char *lpAppendInteger(unsigned char *lp, long long lval);
 unsigned char *lpReplace(unsigned char *lp, unsigned char **p, unsigned char *s, uint32_t slen);
 unsigned char *lpReplaceInteger(unsigned char *lp, unsigned char **p, long long lval);
+int lpReplaceIntegerSameLen(unsigned char *lp, unsigned char *p, long long lval);
 unsigned char *lpDelete(unsigned char *lp, unsigned char *p, unsigned char **newp);
 unsigned char *lpDeleteRangeWithEntry(unsigned char *lp, unsigned char **p, unsigned long num);
 unsigned char *lpDeleteRange(unsigned char *lp, long index, unsigned long num);

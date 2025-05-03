@@ -926,6 +926,10 @@ unsigned char *lpFind(unsigned char *lp, unsigned char *p, unsigned char *s,
  * The element is inserted before, after, or replaces the element pointed
  * by 'p' depending on the 'where' argument, that can be LP_BEFORE, LP_AFTER
  * or LP_REPLACE.
+ *
+ * LP_REPLACE_SAME_LEN functions like LP_REPLACE, but with a stricter constraint:
+ * it only replaces the item if the new item has exactly the same length as the original.
+ * If the lengths differ, the listpack remains unchanged and NULL is returned.
  * 
  * If both 'elestr' and `eleint` are NULL, the function removes the element
  * pointed by 'p' instead of inserting one.
@@ -959,6 +963,12 @@ unsigned char *lpInsert(unsigned char *lp, unsigned char *elestr, unsigned char 
      * zero-length element. So whatever we get passed as 'where', set
      * it to LP_REPLACE. */
     if (delete) where = LP_REPLACE;
+
+    int replace_same_len = 0;
+    if (where == LP_REPLACE_SAME_LEN) {
+        where = LP_REPLACE;
+        replace_same_len = 1;
+    }
 
     /* If we need to insert after the current element, we just jump to the
      * next element (that could be the EOF one) and handle the case of
@@ -1004,6 +1014,9 @@ unsigned char *lpInsert(unsigned char *lp, unsigned char *elestr, unsigned char 
         replaced_len = lpCurrentEncodedSizeUnsafe(p);
         replaced_len += lpEncodeBacklenBytes(replaced_len);
         ASSERT_INTEGRITY_LEN(lp, p, replaced_len);
+        if (replace_same_len && enclen + backlen_size != replaced_len) {
+            return NULL;
+        }
     }
 
     uint64_t new_listpack_bytes = old_listpack_bytes + enclen + backlen_size
@@ -1303,6 +1316,15 @@ unsigned char *lpReplace(unsigned char *lp, unsigned char **p, unsigned char *s,
  * by updating '*p'. */
 unsigned char *lpReplaceInteger(unsigned char *lp, unsigned char **p, long long lval) {
     return lpInsertInteger(lp, lval, *p, LP_REPLACE, p);
+}
+
+int lpReplaceIntegerSameLen(unsigned char *lp, unsigned char *p, long long lval) {
+    unsigned char *replaced = lpInsertInteger(lp, lval, p, LP_REPLACE_SAME_LEN, NULL);
+    if (replaced == NULL) {
+        return 0;
+    }
+    assert(replaced == lp);
+    return 1;
 }
 
 /* Remove the element pointed by 'p', and return the resulting listpack.
@@ -2840,6 +2862,19 @@ int listpackTest(int argc, char *argv[], int flags) {
                         "\xc4\x00\x02" "\xff",
                         27));
         lpFree(lp);
+    }
+
+    TEST("Replace by lpReplaceIntegerSameLen") {
+        lp = createIntList(); /* 4294967296, -100, ... */
+        p = lpFirst(lp);
+        long long x = 4294967295, lval;
+        assert(lpReplaceIntegerSameLen(lp, p, x)); /* successfully replace */
+        lpGetIntegerValue(p, &lval);
+        assert(lval == x);
+        p = lpNext(lp, p);
+        assert(!lpReplaceIntegerSameLen(lp, p, x)); /* fail to replace */
+        lpGetIntegerValue(p, &lval);
+        assert(lval == -100);
     }
 
     TEST("Regression test for >255 byte strings") {
