@@ -38,7 +38,7 @@ void streamFreeNACK(streamNACK *na);
 size_t streamReplyWithRangeFromConsumerPEL(client *c, stream *s, streamID *start, streamID *end, size_t count, streamConsumer *consumer);
 int streamParseStrictIDOrReply(client *c, robj *o, streamID *id, uint64_t missing_seq, int *seq_given);
 int streamParseIDOrReply(client *c, robj *o, streamID *id, uint64_t missing_seq);
-static unsigned char *streamListpakGarbageCollection(unsigned char * lp, unsigned char *range_first, unsigned char *range_tail, int64_t range_lpele_num, int64_t master_fields_count);
+static unsigned char *streamListpackGarbageCollection(unsigned char * lp, unsigned char *range_first, unsigned char *range_tail, int64_t range_lpele_num, int64_t master_fields_count);
 
 /* -----------------------------------------------------------------------
  * Low level stream encoding: a radix tree of listpacks.
@@ -840,7 +840,7 @@ int64_t streamTrim(stream *s, streamAddTrimArgs *args) {
         if (entries == deleted_from_lp) {
             /* We have already removed all the entries, therefore remove the whole node. */
             lpFree(lp);
-            raxRemove(si->stream->rax,si->ri.key,si->ri.key_len,NULL);
+            raxRemove(s->rax,ri.key,ri.key_len,NULL);
         }
         int64_t marked_deleted = lpGetInteger(p);
         /* Here we should perform garbage collection in case at this point
@@ -875,27 +875,29 @@ int64_t streamTrim(stream *s, streamAddTrimArgs *args) {
 }
 
 /* Perform GC by physically removing a range of entries that are all marked as deleted. */
-static unsigned char *streamListpakGarbageCollection(unsigned char * lp, unsigned char *range_first, unsigned char *range_tail, int64_t range_lpele_num, int64_t master_fields_count) {
+static unsigned char *streamListpackGarbageCollection(unsigned char * lp, unsigned char *range_first, unsigned char *range_tail, int64_t range_lpele_num, int64_t master_fields_count) {
     unsigned char *p = range_tail;
     /* Check if there are additional deleted entries contiguous with the range. */
     while (p) {
         uint64_t flag = lpGetInteger(p);
-        if (!(flag & STTREAM_ITEM_FLAG_DELETED)) {
+        if (!(flag & STREAM_ITEM_FLAG_DELETED)) {
             break;
         }
         p = lpNext(lp, p); /* Skip flags */
         p = lpNext(lp, p); /* Skip ID ms */
         p = lpNext(lp, p); /* Skip ID seq */
         int64_t to_skip;
-        if (flag & STREAM_ITEM_FLAG_SAMEFILEDS) {
+        if (flag & STREAM_ITEM_FLAG_SAMEFIELDS) {
             to_skip = master_fields_count;
         } else {
             to_skip = lpGetInteger(p) * 2;
-            p = lpNext(p);
+            p = lpNext(lp, p);
         }
-        while (--to_skip) p = lpNext(lp, p); /* Skip the whole entry. */
+        for (int64_t i = 0; i < to_skip; i++) {
+            p = lpNext(lp, p); /* Skip the whole entry. */
+        }
         p = lpNext(lp,p); /* Skip the final lp-count field. */
-        range_lpele_num += 3 + (flags & STREAM_ITEM_FLAG_SAMEFIELDS ? 0 : 1) + to_skip + 1;
+        range_lpele_num += 3 + (flag & STREAM_ITEM_FLAG_SAMEFIELDS ? 0 : 1) + to_skip + 1;
         range_tail = p;
     }
     return lpDeleteRangeWithEntryPtr(lp, &range_first, range_tail, range_lpele_num);
